@@ -1,130 +1,21 @@
-"""
-Action-Specific Condition Enforcement Check
+"""Action-Specific Condition Enforcement Check.
 
-This check ensures that specific actions have required conditions.
-Supports ALL types of conditions: MFA, IP, VPC, time, tags, encryption, etc.
+Ensures specific actions have required IAM conditions (MFA, IP, tags, etc.).
 
-The entire policy is scanned once, checking all statements for matching actions.
+Action Matching Modes:
+- Simple list: actions: ["iam:PassRole"]
+- any_of: Require conditions if ANY action matches
+- all_of: Require conditions if ALL actions present (overly permissive detection)
+- none_of: Flag forbidden actions
 
-ACTION MATCHING MODES:
-- Simple list: Checks each statement for any of the specified actions
-  Example: actions: ["iam:PassRole", "iam:CreateUser"]
+Merge Strategies (merge_strategy setting):
+- append (default): User + defaults both apply
+- user_only: Disable ALL defaults, use only user requirements
+- per_action_override: User replaces defaults for matching actions
+- replace_all: User replaces all if provided
+- defaults_only: Ignore user, use only defaults
 
-- any_of: Finds statements that contain ANY of the specified actions
-  Example: actions: {any_of: ["iam:CreateUser", "iam:AttachUserPolicy"]}
-
-- all_of: Finds statements that contain ALL specified actions (overly permissive detection)
-  Example: actions: {all_of: ["iam:CreateAccessKey", "iam:UpdateAccessKey"]}
-
-- none_of: Flags statements that contain forbidden actions
-  Example: actions: {none_of: ["iam:DeleteUser", "s3:DeleteBucket"]}
-
-Common use cases:
-- iam:PassRole must have iam:PassedToService condition
-- Sensitive actions must have MFA conditions
-- Actions must have source IP restrictions
-- Resources must have required tags
-- Combine multiple conditions (MFA + IP + Tags)
-- Detect overly permissive statements (all_of)
-- Ensure privilege escalation combinations are protected
-
-Configuration in iam-validator.yaml:
-
-    checks:
-      action_condition_enforcement:
-        enabled: true
-        severity: high
-        description: "Enforce specific conditions for specific actions"
-
-        action_condition_requirements:
-          # BASIC: Simple action with required condition
-          - actions:
-              - "iam:PassRole"
-            required_conditions:
-              - condition_key: "iam:PassedToService"
-                description: "Specify which AWS services can use the passed role"
-
-          # MFA + IP restrictions
-          - actions:
-              - "iam:DeleteUser"
-            required_conditions:
-              all_of:
-                - condition_key: "aws:MultiFactorAuthPresent"
-                  expected_value: true
-                - condition_key: "aws:SourceIp"
-
-          # EC2 with TAGS + MFA + Region
-          - actions:
-              - "ec2:RunInstances"
-            required_conditions:
-              all_of:
-                - condition_key: "aws:MultiFactorAuthPresent"
-                  expected_value: true
-                - condition_key: "aws:RequestTag/Environment"
-                  operator: "StringEquals"
-                  expected_value: ["Production", "Staging", "Development"]
-                - condition_key: "aws:RequestTag/Owner"
-                - condition_key: "aws:RequestedRegion"
-                  expected_value: ["us-east-1", "us-west-2"]
-
-          # Principal-to-resource tag matching
-          - actions:
-              - "ec2:RunInstances"
-            required_conditions:
-              - condition_key: "aws:ResourceTag/owner"
-                operator: "StringEquals"
-                expected_value: "${aws:PrincipalTag/owner}"
-                description: "Resource owner must match principal's owner tag"
-
-          # Complex: all_of + any_of for actions and conditions
-          - actions:
-              any_of:
-                - "cloudformation:CreateStack"
-                - "cloudformation:UpdateStack"
-            required_conditions:
-              all_of:
-                - condition_key: "aws:MultiFactorAuthPresent"
-                  expected_value: true
-                - condition_key: "aws:RequestTag/Environment"
-              any_of:
-                - condition_key: "aws:SourceIp"
-                - condition_key: "aws:SourceVpce"
-
-          # none_of for conditions: Ensure certain conditions are NOT present
-          - actions:
-              - "s3:GetObject"
-            required_conditions:
-              none_of:
-                - condition_key: "aws:SecureTransport"
-                  expected_value: false
-                  description: "Ensure insecure transport is never allowed"
-
-          # any_of for actions: If ANY statement grants privilege escalation actions, require MFA
-          - actions:
-              any_of:
-                - "iam:CreateUser"
-                - "iam:AttachUserPolicy"
-                - "iam:PutUserPolicy"
-            required_conditions:
-              - condition_key: "aws:MultiFactorAuthPresent"
-                expected_value: true
-            description: "Privilege escalation actions require MFA"
-            severity: "critical"
-
-          # all_of for actions: Flag statements that contain BOTH dangerous actions (overly permissive)
-          - actions:
-              all_of:
-                - "iam:CreateAccessKey"
-                - "iam:UpdateAccessKey"
-            severity: "critical"
-            description: "Statement grants both CreateAccessKey and UpdateAccessKey - too permissive"
-
-          # none_of for actions: Flag if forbidden actions are present
-          - actions:
-              none_of:
-                - "iam:DeleteUser"
-                - "s3:DeleteBucket"
-            description: "These dangerous actions should never be used"
+For full documentation, see: docs/condition-requirements.md
 """
 
 import re
@@ -132,7 +23,9 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from iam_validator.core.aws_service import AWSServiceFetcher
 from iam_validator.core.check_registry import CheckConfig, PolicyCheck
+from iam_validator.core.ignore_patterns import IgnorePatternMatcher
 from iam_validator.core.models import Statement, ValidationIssue
+from iam_validator.utils.regex import compile_and_cache
 
 if TYPE_CHECKING:
     from iam_validator.core.models import IAMPolicy
@@ -180,15 +73,11 @@ class ActionConditionEnforcementCheck(PolicyCheck):
         Returns:
             List of ValidationIssue objects found by this check
         """
-        del policy_file, kwargs  # Not used in current implementation
+        del kwargs  # Not used in current implementation
         issues = []
 
-        # Get action condition requirements from config
-        # Support both old (policy_level_requirements) and new (action_condition_requirements) keys
-        requirements = config.config.get(
-            "action_condition_requirements",
-            config.config.get("policy_level_requirements", []),
-        )
+        # Get action condition requirements using configurable merge strategy
+        requirements = self._get_merged_requirements(config, policy_file)
 
         if not requirements:
             return issues
@@ -204,15 +93,260 @@ class ActionConditionEnforcementCheck(PolicyCheck):
             if uses_logical_operators:
                 # Policy-wide detection (all_of/any_of/none_of)
                 policy_issues = await self._check_policy_wide(policy, requirement, fetcher, config)
+                # Filter by requirement-level ignore_patterns
+                policy_issues = self._filter_requirement_issues(
+                    policy_issues, requirement.get("ignore_patterns", []), policy_file
+                )
                 issues.extend(policy_issues)
             else:
                 # Per-statement check (simple list)
                 statement_issues = await self._check_per_statement(
                     policy, requirement, fetcher, config
                 )
+                # Filter by requirement-level ignore_patterns
+                statement_issues = self._filter_requirement_issues(
+                    statement_issues, requirement.get("ignore_patterns", []), policy_file
+                )
                 issues.extend(statement_issues)
 
         return issues
+
+    def _get_merged_requirements(
+        self,
+        config: CheckConfig,
+        policy_file: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get merged requirements based on configured merge strategy.
+
+        Supports multiple merge strategies to control how user requirements
+        interact with default requirements:
+        - "per_action_override": User requirements replace defaults for matching actions (default)
+        - "append": User requirements added to defaults (both apply)
+        - "replace_all": User requirements completely replace ALL defaults
+        - "defaults_only": Ignore user requirements, use only defaults
+        - "user_only": Ignore defaults, use only user requirements
+
+        Args:
+            config: Check configuration containing requirements and merge strategy
+            policy_file: Path to the policy file being checked (for ignore_patterns)
+
+        Returns:
+            Merged list of requirements based on strategy
+        """
+        # Get default and user requirements
+        default_requirements = config.config.get(
+            "requirements",
+            config.config.get("policy_level_requirements", []),
+        )
+        user_requirements = config.config.get("action_condition_requirements")
+
+        # Get merge strategy (default: append - both defaults and user requirements apply)
+        merge_strategy = config.config.get("merge_strategy", "append")
+
+        # For user_only, replace_all, and per_action_override:
+        # Filter user requirements by ignore_patterns BEFORE merging
+        # For append and defaults_only: ignore_patterns on user requirements still apply
+        if user_requirements:
+            active_user_requirements = self._filter_requirements_by_filepath(
+                user_requirements, policy_file
+            )
+        else:
+            active_user_requirements = []
+
+        # Apply merge strategy
+        if merge_strategy == "user_only":
+            # Use ONLY user requirements - no defaults at all
+            # If a user requirement is filtered by ignore_patterns, it's simply not checked
+            return active_user_requirements
+
+        elif merge_strategy == "defaults_only":
+            # Use ONLY defaults - ignore all user requirements
+            return default_requirements
+
+        elif merge_strategy == "replace_all":
+            # User requirements completely replace ALL defaults (if user provided any)
+            # If no user requirements provided, fall back to defaults
+            if user_requirements:  # Check original, not filtered
+                return active_user_requirements
+            return default_requirements
+
+        elif merge_strategy == "per_action_override":
+            # User requirements replace defaults for MATCHING actions only
+            # Non-matching defaults are kept
+            # Note: We use the ORIGINAL user_requirements to determine which actions
+            # are "user-defined" (even if filtered out by ignore_patterns)
+            return self._merge_per_action_override(
+                default_requirements, user_requirements or [], active_user_requirements
+            )
+
+        else:  # "append" (default)
+            # Both defaults AND user requirements apply
+            # User requirements are added on top of defaults
+            return default_requirements + active_user_requirements
+
+    def _filter_requirements_by_filepath(
+        self,
+        requirements: list[dict[str, Any]],
+        policy_file: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Filter out requirements that should be ignored for this file.
+
+        This handles ignore_patterns at the requirement level BEFORE merging,
+        allowing defaults to apply when user requirements are ignored.
+
+        Args:
+            requirements: List of requirements to filter
+            policy_file: Path to the policy file being checked
+
+        Returns:
+            Filtered list of requirements (excluding ignored ones)
+
+        Example:
+            User defines: iam:CreateRole with ignore_patterns: [".*test/.*"]
+            When checking test/policy.json:
+            - User requirement is filtered out
+            - Default iam:CreateRole requirement can apply instead
+        """
+        active_reqs = []
+
+        for req in requirements:
+            ignore_patterns = req.get("ignore_patterns", [])
+
+            if not ignore_patterns:
+                # No ignore patterns - include this requirement
+                active_reqs.append(req)
+                continue
+
+            # Check if any ignore pattern matches this file
+            should_ignore = self._should_ignore_filepath(policy_file, ignore_patterns)
+
+            if not should_ignore:
+                active_reqs.append(req)
+
+        return active_reqs
+
+    def _should_ignore_filepath(
+        self,
+        filepath: str,
+        ignore_patterns: list[dict[str, Any]],
+    ) -> bool:
+        """
+        Check if filepath matches any of the ignore patterns.
+
+        Only checks filepath-based patterns (filepath, filepath_regex).
+        This is used for filtering requirements before merging.
+
+        Args:
+            filepath: Path to the policy file
+            ignore_patterns: List of ignore pattern dictionaries
+
+        Returns:
+            True if filepath matches any pattern
+        """
+        for pattern in ignore_patterns:
+            # Only check filepath-based patterns
+            if "filepath" in pattern or "filepath_regex" in pattern:
+                regex_pattern = pattern.get("filepath") or pattern.get("filepath_regex")
+                if regex_pattern:
+                    compiled = compile_and_cache(regex_pattern)
+                    if compiled and compiled.search(filepath):
+                        return True
+        return False
+
+    def _merge_per_action_override(
+        self,
+        default_requirements: list[dict[str, Any]],
+        all_user_requirements: list[dict[str, Any]],
+        active_user_requirements: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Merge user requirements with defaults on a per-action basis.
+
+        User requirements override defaults for matching actions.
+        Defaults are kept for actions not specified by user.
+
+        Key behavior with ignore_patterns:
+        - If user defines a requirement for action X with ignore_patterns
+        - And the current file matches the ignore_patterns
+        - Then: The user requirement is SKIPPED (not applied)
+        - AND: The default for action X is ALSO skipped (user "owns" this action)
+        - Result: No check for action X on this file
+
+        Args:
+            default_requirements: Default requirements from system config
+            all_user_requirements: ALL user requirements (before ignore_patterns filtering)
+            active_user_requirements: User requirements after ignore_patterns filtering
+
+        Returns:
+            Merged list of requirements
+        """
+        # Build a set of actions that user has customized (from ALL user requirements)
+        # This determines which defaults to exclude
+        user_actions = set()
+        for req in all_user_requirements:
+            actions = req.get("actions", [])
+            # Handle both single action and list of actions
+            if isinstance(actions, str):
+                user_actions.add(actions)
+            else:
+                user_actions.update(actions)
+
+        # Start with ACTIVE user requirements (filtered by ignore_patterns)
+        merged = list(active_user_requirements)
+
+        # Add defaults that don't conflict with user requirements
+        for default_req in default_requirements:
+            default_actions = default_req.get("actions", [])
+            # Handle both single action and list of actions
+            if isinstance(default_actions, str):
+                default_actions = [default_actions]
+
+            # Check if any of the default actions are customized by user
+            has_overlap = any(action in user_actions for action in default_actions)
+
+            if not has_overlap:
+                # No overlap - keep this default requirement
+                merged.append(default_req)
+
+        return merged
+
+    def _filter_requirement_issues(
+        self,
+        issues: list[ValidationIssue],
+        ignore_patterns: list[dict[str, Any]],
+        filepath: str,
+    ) -> list[ValidationIssue]:
+        """
+        Filter issues based on requirement-level ignore patterns.
+
+        This allows each requirement within action_condition_enforcement to have its own
+        ignore patterns, enabling fine-grained control over which findings to suppress.
+
+        Args:
+            issues: List of validation issues to filter
+            ignore_patterns: List of ignore pattern dictionaries for this requirement
+            filepath: Path to the policy file being checked
+
+        Returns:
+            Filtered list of issues (issues matching ignore patterns are removed)
+
+        Example:
+            A requirement can ignore specific files while other requirements check them:
+            - actions: ["iam:CreateRole"]
+              required_conditions: [...]
+              ignore_patterns:
+                - filepath_regex: ".*modules/iam-openid.*"
+        """
+        if not ignore_patterns:
+            return issues
+
+        return [
+            issue
+            for issue in issues
+            if not IgnorePatternMatcher.should_ignore_issue(issue, filepath, ignore_patterns)
+        ]
 
     async def _check_policy_wide(
         self,
@@ -683,7 +817,8 @@ class ActionConditionEnforcementCheck(PolicyCheck):
         matching_actions: list[str] = []
 
         # Handle simple list format (backward compatibility)
-        if isinstance(actions_config, list) and actions_config:
+        # Also handle requirements with only action_patterns (when actions is empty list)
+        if isinstance(actions_config, list) and (actions_config or action_patterns):
             # Simple list - check if any action matches
             for stmt_action in statement_actions:
                 if stmt_action == "*":
@@ -701,9 +836,9 @@ class ActionConditionEnforcementCheck(PolicyCheck):
                         matched = True
                         break
 
-                # If not matched by actions, check if wildcard overlaps with patterns
-                if not matched and "*" in stmt_action:
-                    # For wildcards, also check pattern overlap directly
+                # If not matched by actions, check against action_patterns directly
+                if not matched and action_patterns:
+                    # Check if statement action matches any of the patterns
                     matched = await self._action_matches(stmt_action, "", action_patterns, fetcher)
 
                 if matched and stmt_action not in matching_actions:
@@ -804,10 +939,11 @@ class ActionConditionEnforcementCheck(PolicyCheck):
 
         # AWS wildcard match in required_action (e.g., "s3:*", "s3:Get*")
         if "*" in required_action:
-            # Convert AWS wildcard to regex
+            # Convert AWS wildcard to regex and cache compilation
             wildcard_pattern = required_action.replace("*", ".*").replace("?", ".")
             try:
-                if re.match(f"^{wildcard_pattern}$", statement_action):
+                compiled_pattern = compile_and_cache(f"^{wildcard_pattern}$")
+                if compiled_pattern.match(statement_action):
                     return True
             except re.error:
                 # Invalid regex pattern - skip this match attempt
@@ -824,7 +960,8 @@ class ActionConditionEnforcementCheck(PolicyCheck):
                 # Required action is specific (e.g., "iam:CreateUser")
                 # Check if statement wildcard would grant it
                 try:
-                    if re.match(f"^{stmt_wildcard_pattern}$", required_action):
+                    compiled_pattern = compile_and_cache(f"^{stmt_wildcard_pattern}$")
+                    if compiled_pattern.match(required_action):
                         return True
                 except re.error:
                     # Invalid regex pattern - skip this match attempt
@@ -856,7 +993,8 @@ class ActionConditionEnforcementCheck(PolicyCheck):
                         full_granted_action = f"{service_prefix}:{granted_action}"
                         for pattern in patterns:
                             try:
-                                if re.match(pattern, full_granted_action):
+                                compiled_pattern = compile_and_cache(pattern)
+                                if compiled_pattern.match(full_granted_action):
                                     return True
                             except re.error:
                                 continue
@@ -866,7 +1004,8 @@ class ActionConditionEnforcementCheck(PolicyCheck):
                     stmt_prefix = statement_action.rstrip("*")
                     for pattern in patterns:
                         try:
-                            if re.match(pattern, stmt_prefix):
+                            compiled_pattern = compile_and_cache(pattern)
+                            if compiled_pattern.match(stmt_prefix):
                                 return True
                         except re.error:
                             continue
@@ -874,7 +1013,8 @@ class ActionConditionEnforcementCheck(PolicyCheck):
         # Regex pattern match (from action_patterns config)
         for pattern in patterns:
             try:
-                if re.match(pattern, statement_action):
+                compiled_pattern = compile_and_cache(pattern)
+                if compiled_pattern.match(statement_action):
                     return True
             except re.error:
                 continue
@@ -942,33 +1082,52 @@ class ActionConditionEnforcementCheck(PolicyCheck):
                 )
 
                 if not any_present:
-                    # Create a combined error for any_of
-                    # Handle both simple conditions and nested all_of
-                    condition_keys = []
-                    for cond in any_of:
-                        if "all_of" in cond:
-                            # Nested all_of - collect all condition keys
-                            nested_keys = [
-                                c.get("condition_key", "unknown") for c in cond["all_of"]
-                            ]
-                            condition_keys.append(f"({' + '.join(f'`{k}`' for k in nested_keys)})")
-                        else:
-                            # Simple condition
-                            condition_keys.append(f"`{cond.get('condition_key', 'unknown')}`")
-                    condition_keys_formatted = " OR ".join(condition_keys)
-                    matching_actions_formatted = ", ".join(f"`{a}`" for a in matching_actions)
+                    # Check if requirement has custom message/suggestion/example
+                    custom_message = requirement.get("message") if requirement else None
+                    custom_suggestion = requirement.get("suggestion") if requirement else None
+                    custom_example = requirement.get("example") if requirement else None
+
+                    if custom_message:
+                        # Use fully custom message/suggestion/example from requirement
+                        message = custom_message
+                        suggestion = custom_suggestion or ""
+                        example = custom_example or ""
+                    else:
+                        # Generate default message and build suggestion from conditions
+                        condition_keys = []
+                        for cond in any_of:
+                            if "all_of" in cond:
+                                # Nested all_of - collect all condition keys
+                                nested_keys = [
+                                    c.get("condition_key", "unknown") for c in cond["all_of"]
+                                ]
+                                condition_keys.append(
+                                    f"({' + '.join(f'`{k}`' for k in nested_keys)})"
+                                )
+                            else:
+                                # Simple condition
+                                condition_keys.append(f"`{cond.get('condition_key', 'unknown')}`")
+                        condition_keys_formatted = " OR ".join(condition_keys)
+                        matching_actions_formatted = ", ".join(f"`{a}`" for a in matching_actions)
+
+                        message = (
+                            f"Actions {matching_actions_formatted} require at least ONE of these conditions: "
+                            f"{condition_keys_formatted}"
+                        )
+
+                        # Build suggestion and examples from conditions
+                        suggestion, example = self._build_any_of_suggestion(any_of)
+
                     issues.append(
                         ValidationIssue(
                             severity=self.get_severity(config),
                             statement_sid=statement.sid,
                             statement_index=statement_idx,
                             issue_type="missing_required_condition_any_of",
-                            message=(
-                                f"Actions `{matching_actions_formatted}` require at least ONE of these conditions: "
-                                f"{condition_keys_formatted}"
-                            ),
+                            message=message,
                             action=", ".join(matching_actions),
-                            suggestion=self._build_any_of_suggestion(any_of),
+                            suggestion=suggestion,
+                            example=example if example else None,
                             line_number=statement.line_number,
                         )
                     )
@@ -1108,7 +1267,7 @@ class ActionConditionEnforcementCheck(PolicyCheck):
             statement_sid=statement.sid,
             statement_index=statement_idx,
             issue_type="missing_required_condition",
-            message=f"{message_prefix} Action(s) `{matching_actions_str}` require condition `{condition_key}`",
+            message=f"{message_prefix} Action(s) {matching_actions_str} require condition `{condition_key}`",
             action=", ".join(matching_actions),
             condition_key=condition_key,
             suggestion=suggestion_text,
@@ -1167,12 +1326,24 @@ class ActionConditionEnforcementCheck(PolicyCheck):
 
         return suggestion, example_code
 
-    def _build_any_of_suggestion(self, any_of_conditions: list[dict[str, Any]]) -> str:
-        """Build suggestion for any_of conditions."""
+    def _build_any_of_suggestion(self, any_of_conditions: list[dict[str, Any]]) -> tuple[str, str]:
+        """Build suggestion and combined examples for any_of conditions.
+
+        Always uses clean formatting without "Option X" prefixes.
+        Uses either:
+        - 'message' field if provided (custom message)
+        - 'description' field if provided (displays as: `condition_key` - description)
+        - Just 'condition_key' if neither message nor description provided
+
+        Returns:
+            Tuple of (suggestion_text, combined_examples)
+        """
         suggestions = []
+        examples = []
+
         suggestions.append("Add at least ONE of these conditions:")
 
-        for i, cond in enumerate(any_of_conditions, 1):
+        for cond in any_of_conditions:
             # Handle nested all_of blocks
             if "all_of" in cond:
                 # Nested all_of - show all required conditions together
@@ -1180,35 +1351,55 @@ class ActionConditionEnforcementCheck(PolicyCheck):
                 condition_keys = [c.get("condition_key", "unknown") for c in all_of_list]
                 condition_keys_formatted = " + ".join(f"`{k}`" for k in condition_keys)
 
-                option = f"\n- **Option {i}**: {condition_keys_formatted} (both required)"
+                # Check for custom message first
+                custom_message = cond.get("message")
+                if custom_message:
+                    suggestions.append(f"\n- {custom_message}")
+                else:
+                    # Use description from first condition or combine them
+                    descriptions = [
+                        c.get("description", "") for c in all_of_list if c.get("description")
+                    ]
+                    if descriptions:
+                        suggestions.append(f"\n- {condition_keys_formatted} - {descriptions[0]}")
+                    else:
+                        suggestions.append(f"\n- {condition_keys_formatted} (both required)")
 
-                # Use description from first condition or combine them
-                descriptions = [
-                    c.get("description", "") for c in all_of_list if c.get("description")
-                ]
-                if descriptions:
-                    option += f" - {descriptions[0]}"
-
-                # Show example from first condition that has one
+                # Collect example from first condition that has one
                 for c in all_of_list:
                     if c.get("example"):
-                        # Example will be shown separately, just note it's available
+                        examples.append(c["example"])
                         break
             else:
-                # Simple condition (original behavior)
-                condition_key = cond.get("condition_key", "unknown")
-                description = cond.get("description", "")
-                expected_value = cond.get("expected_value")
+                # Simple condition - check for message, description, or just condition_key
+                custom_message = cond.get("message")
+                if custom_message:
+                    # Use custom message directly
+                    suggestions.append(f"\n- {custom_message}")
+                else:
+                    # Use description if available
+                    condition_key = cond.get("condition_key", "unknown")
+                    description = cond.get("description", "")
+                    expected_value = cond.get("expected_value")
 
-                option = f"\n- **Option {i}**: `{condition_key}`"
-                if description:
-                    option += f" - {description}"
-                if expected_value is not None:
-                    option += f" (value: `{expected_value}`)"
+                    if description:
+                        # Format: - `condition_key` - description
+                        suggestions.append(f"\n- `{condition_key}` - {description}")
+                    else:
+                        # Format: - `condition_key` (with expected value if present)
+                        suggestion_line = f"\n- `{condition_key}`"
+                        if expected_value is not None:
+                            suggestion_line += f" (value: `{expected_value}`)"
+                        suggestions.append(suggestion_line)
 
-            suggestions.append(option)
+                # Collect example if present (no prefix)
+                if cond.get("example"):
+                    examples.append(cond["example"])
 
-        return "".join(suggestions)
+        suggestion_text = "".join(suggestions)
+        combined_examples = "\n\n".join(examples) if examples else ""
+
+        return suggestion_text, combined_examples
 
     def _create_none_of_issue(
         self,

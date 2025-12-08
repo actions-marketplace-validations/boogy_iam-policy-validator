@@ -69,7 +69,7 @@ jobs:
           echo "✅ PR #${{ inputs.pr_number }}: $TITLE (branch: $BRANCH)"
 
       - name: Checkout PR branch
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v5
         with:
           ref: ${{ steps.pr_info.outputs.branch }}
           fetch-depth: 0
@@ -80,7 +80,7 @@ jobs:
           python-version: ${{ inputs.python_version }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@5a7eac68fb9809dea845d802897dc5c723910fa3 # v7
+        uses: astral-sh/setup-uv@1e862dfacbd1d6d858c55d9b792c756523627244 # v7
         with:
           enable-cache: true
 
@@ -178,7 +178,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Pre-Release
-        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
           name: "${{ steps.version.outputs.tag }}"
           tag_name: ${{ steps.version.outputs.tag }}
