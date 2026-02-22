@@ -9,6 +9,7 @@ Last updated: 2025-01-17
 """
 
 import re
+import threading
 from typing import Any
 
 from iam_validator.core.constants import AWS_TAG_KEY_ALLOWED_CHARS
@@ -71,18 +72,27 @@ AWS_GLOBAL_CONDITION_KEYS = {
     "aws:ViaAWSService": "Bool",  # Whether AWS service made the request
 }
 
+# Global condition keys that restrict resource scope.
+# These conditions are always valid for all services and directly constrain
+# which resources can be accessed, making them suitable for lowering severity
+# when used with wildcard resources.
+# Reference: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-resourceaccount
+GLOBAL_RESOURCE_SCOPING_CONDITION_KEYS = frozenset(
+    {
+        "aws:ResourceAccount",  # Limits to specific AWS account(s)
+        "aws:ResourceOrgID",  # Limits to specific AWS Organization
+        "aws:ResourceOrgPaths",  # Limits to specific OU paths
+    }
+)
+
 # Patterns that should be recognized (wildcards and tag-based keys)
-# These allow things like aws:RequestTag/Department or aws:PrincipalTag/Environment
+# IMPORTANT: aws:RequestTag and aws:ResourceTag are NOT global condition keys!
+# They are action-specific or resource-specific and must be explicitly listed in
+# the action's ActionConditionKeys or the resource's ConditionKeys.
+# Only aws:PrincipalTag is a true global condition key.
+#
 # Uses centralized tag key character class from constants
 AWS_CONDITION_KEY_PATTERNS = [
-    {
-        "pattern": rf"^aws:RequestTag/[{AWS_TAG_KEY_ALLOWED_CHARS}]+$",
-        "description": "Tag keys in the request (for tag-based access control)",
-    },
-    {
-        "pattern": rf"^aws:ResourceTag/[{AWS_TAG_KEY_ALLOWED_CHARS}]+$",
-        "description": "Tags on the resource being accessed",
-    },
     {
         "pattern": rf"^aws:PrincipalTag/[{AWS_TAG_KEY_ALLOWED_CHARS}]+$",
         "description": "Tags attached to the principal making the request",
@@ -153,6 +163,7 @@ class AWSGlobalConditions:
 
 # Singleton instance
 _global_conditions_instance = None
+_global_conditions_lock = threading.Lock()
 
 
 def get_global_conditions() -> AWSGlobalConditions:
@@ -160,5 +171,7 @@ def get_global_conditions() -> AWSGlobalConditions:
     global _global_conditions_instance  # pylint: disable=global-statement
 
     if _global_conditions_instance is None:
-        _global_conditions_instance = AWSGlobalConditions()
+        with _global_conditions_lock:
+            if _global_conditions_instance is None:
+                _global_conditions_instance = AWSGlobalConditions()
     return _global_conditions_instance

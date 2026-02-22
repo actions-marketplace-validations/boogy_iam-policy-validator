@@ -61,9 +61,7 @@ class TestSetOperatorValidationCheck:
         assert len(issues) == 0
 
     @pytest.mark.asyncio
-    async def test_valid_forallvalues_with_multivalued_key_and_null_check(
-        self, check, config
-    ):
+    async def test_valid_forallvalues_with_multivalued_key_and_null_check(self, check, config):
         """Test valid ForAllValues usage with multivalued key and Null check."""
         statement = Statement(
             effect="Allow",
@@ -161,10 +159,7 @@ class TestSetOperatorValidationCheck:
         issues = await check.execute(statement, 0, None, config)
         # Should only warn about single-valued key usage if applicable
         # ForAllValues with Deny doesn't need Null check warning
-        assert all(
-            issue.issue_type != "forallvalues_allow_without_null_check"
-            for issue in issues
-        )
+        assert all(issue.issue_type != "forallvalues_allow_without_null_check" for issue in issues)
 
     @pytest.mark.asyncio
     async def test_foranyvalue_deny_without_null_check(self, check, config):
@@ -201,9 +196,7 @@ class TestSetOperatorValidationCheck:
         )
         issues = await check.execute(statement, 0, None, config)
         # Should not warn about Null check for ForAnyValue with Allow
-        assert all(
-            issue.issue_type != "foranyvalue_deny_without_null_check" for issue in issues
-        )
+        assert all(issue.issue_type != "foranyvalue_deny_without_null_check" for issue in issues)
 
     @pytest.mark.asyncio
     async def test_multiple_set_operators_multiple_issues(self, check, config):
@@ -262,9 +255,7 @@ class TestSetOperatorValidationCheck:
         )
         issues = await check.execute(statement, 0, None, config)
         # Should not generate set_operator_on_single_valued_key error
-        assert all(
-            issue.issue_type != "set_operator_on_single_valued_key" for issue in issues
-        )
+        assert all(issue.issue_type != "set_operator_on_single_valued_key" for issue in issues)
 
     @pytest.mark.asyncio
     async def test_statement_with_sid(self, check, config):
@@ -322,9 +313,7 @@ class TestSetOperatorValidationCheck:
     @pytest.mark.asyncio
     async def test_custom_severity(self, check):
         """Test custom severity from config."""
-        config = CheckConfig(
-            check_id="set_operator_validation", enabled=True, severity="warning"
-        )
+        config = CheckConfig(check_id="set_operator_validation", enabled=True, severity="warning")
         statement = Statement(
             effect="Allow",
             action=["s3:GetObject"],
@@ -360,10 +349,7 @@ class TestSetOperatorValidationCheck:
         # Null check tracks presence of key, not value
         # Current implementation just checks if Null condition exists for the key
         # So this should NOT warn (limitation of current implementation)
-        assert all(
-            issue.issue_type != "forallvalues_allow_without_null_check"
-            for issue in issues
-        )
+        assert all(issue.issue_type != "forallvalues_allow_without_null_check" for issue in issues)
 
     @pytest.mark.asyncio
     async def test_condition_key_in_issue(self, check, config):
@@ -381,3 +367,74 @@ class TestSetOperatorValidationCheck:
         issues = await check.execute(statement, 0, None, config)
         assert len(issues) == 2  # single-valued key error + missing Null check
         assert all(issue.condition_key == "aws:username" for issue in issues)
+
+
+class TestForAllValuesIfExistsCompound:
+    """Test ForAllValues + IfExists compound warning."""
+
+    @pytest.fixture
+    def check(self):
+        return SetOperatorValidationCheck()
+
+    @pytest.fixture
+    def config(self):
+        return CheckConfig(check_id="set_operator_validation", enabled=True)
+
+    @pytest.mark.asyncio
+    async def test_forallvalues_ifexists_compound_warning(self, check, config):
+        """ForAllValues + IfExists + Allow without Null should have compound message."""
+        statement = Statement(
+            effect="Allow",
+            action=["s3:DeleteObjectTagging"],
+            resource=["*"],
+            condition={
+                "ForAllValues:StringEqualsIfExists": {
+                    "aws:TagKeys": ["environment"],
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        forallvalues_issues = [i for i in issues if i.issue_type == "forallvalues_allow_without_null_check"]
+        assert len(forallvalues_issues) == 1
+        assert "Compounded" in forallvalues_issues[0].message
+        assert "doubly permissive" in forallvalues_issues[0].message
+        assert "ForAllValues" in forallvalues_issues[0].message
+        assert "IfExists" in forallvalues_issues[0].message
+
+    @pytest.mark.asyncio
+    async def test_forallvalues_without_ifexists_standard_warning(self, check, config):
+        """ForAllValues without IfExists should have standard warning."""
+        statement = Statement(
+            effect="Allow",
+            action=["s3:DeleteObjectTagging"],
+            resource=["*"],
+            condition={
+                "ForAllValues:StringEquals": {
+                    "aws:TagKeys": ["environment"],
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        forallvalues_issues = [i for i in issues if i.issue_type == "forallvalues_allow_without_null_check"]
+        assert len(forallvalues_issues) == 1
+        assert "Compounded" not in forallvalues_issues[0].message
+        assert "Security risk" in forallvalues_issues[0].message
+
+    @pytest.mark.asyncio
+    async def test_forallvalues_ifexists_with_null_check_no_warning(self, check, config):
+        """ForAllValues + IfExists with Null check should not warn."""
+        statement = Statement(
+            effect="Allow",
+            action=["s3:DeleteObjectTagging"],
+            resource=["*"],
+            condition={
+                "ForAllValues:StringEqualsIfExists": {
+                    "aws:TagKeys": ["environment"],
+                },
+                "Null": {
+                    "aws:TagKeys": "false",
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert not any(i.issue_type == "forallvalues_allow_without_null_check" for i in issues)

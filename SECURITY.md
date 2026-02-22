@@ -15,6 +15,7 @@ We appreciate responsible disclosure of security vulnerabilities. If you discove
 Instead, please report security issues via one of these methods:
 
 1. **GitHub Security Advisories** (Preferred)
+
    - Go to the [Security Advisories page](https://github.com/boogy/iam-policy-validator/security/advisories)
    - Click "Report a vulnerability"
    - Provide detailed information about the vulnerability
@@ -182,38 +183,13 @@ When contributing to the project:
 
 The validator includes security features to help users:
 
-1. **18 Built-in Security Checks**: Detect overly permissive policies, privilege escalation paths, and security anti-patterns
+1. **21 Built-in Security Checks**: Detect overly permissive policies, privilege escalation paths, and security anti-patterns
 2. **AWS Access Analyzer Integration**: Leverage AWS's official policy validation service
 3. **Privilege Escalation Detection**: Identify dangerous action combinations
 4. **Public Access Detection**: Check 29+ AWS resource types for public exposure
 5. **Action Condition Enforcement**: Ensure sensitive actions have required conditions
 6. **Policy Comparison**: Detect new permissions vs baseline to prevent scope creep
 7. **Wildcard Detection**: Flag overly permissive wildcards in actions and resources
-
-## Vulnerability Disclosure Policy
-
-### Scope
-
-Security vulnerabilities within scope:
-
-- **In Scope**:
-  - Authentication and authorization bypass
-  - Code injection vulnerabilities
-  - Sensitive data exposure
-  - Denial of service (DoS)
-  - AWS credential leakage
-  - GitHub token leakage
-  - Path traversal vulnerabilities
-  - Dependency vulnerabilities with active exploits
-  - Logic errors in security checks that could miss vulnerabilities
-
-- **Out of Scope**:
-  - Social engineering attacks
-  - Physical attacks
-  - Attacks requiring physical access to infrastructure
-  - Issues in third-party dependencies without active exploits
-  - Issues already reported and known
-  - Self-XSS or CSP bypasses without security impact
 
 ### Safe Harbor
 
@@ -224,35 +200,15 @@ We support safe harbor for security researchers who:
 - Do not exploit vulnerabilities for malicious purposes
 - Follow responsible disclosure practices
 
-## Security Audit History
-
-We welcome third-party security audits and will list notable audits here:
-
-- No formal audits completed yet (as of v1.7.0)
-
-## Security-Related Configuration
-
-### Logging Levels
-
-Be cautious with logging levels in production:
-
-```bash
-# ⚠️ WARNING: Debug logging may expose sensitive policy content
---log-level debug  # Only use for troubleshooting
-
-# ✅ RECOMMENDED: Use warning or error in production
---log-level warning
-```
-
 ### GitHub Integration
 
 Configure minimal permissions for GitHub Actions:
 
 ```yaml
 permissions:
-  contents: read           # Required: Read repository content
-  pull-requests: write     # Required: Post PR comments
-  id-token: write         # Required only for AWS OIDC authentication
+  contents: read # Required: Read repository content
+  pull-requests: write # Required: Post PR comments
+  id-token: write # Required only for AWS OIDC authentication
 ```
 
 ## Contact
@@ -286,5 +242,5 @@ _Thank you to the following researchers who have helped improve the security of 
 
 ---
 
-**Last Updated**: 2025-11-10
-**Policy Version**: 1.0
+**Last Updated**: 2026-01-19
+**Policy Version**: 1.1

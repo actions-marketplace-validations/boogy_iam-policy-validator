@@ -90,9 +90,7 @@ class ValidationContext:
             config_path=self.config_path,
         )
 
-    async def validate_json(
-        self, policy_json: dict, policy_name: str = "inline-policy"
-    ) -> PolicyValidationResult:
+    async def validate_json(self, policy_json: dict, policy_name: str = "inline-policy") -> PolicyValidationResult:
         """
         Validate an IAM policy from a Python dictionary.
 
@@ -123,9 +121,7 @@ class ValidationContext:
             )
         )
 
-    def generate_report(
-        self, results: list[PolicyValidationResult], format: str = "console"
-    ) -> str:
+    def generate_report(self, results: list[PolicyValidationResult], format: str = "console") -> str:
         """
         Generate a report from validation results.
 
@@ -197,8 +193,8 @@ async def validator(
         ...     results = await v.validate_directory("./policies")
         ...     v.generate_report(results, format="console")
     """
-    fetcher = AWSServiceFetcher()
-    yield ValidationContext(fetcher, config_path)
+    async with AWSServiceFetcher() as fetcher:
+        yield ValidationContext(fetcher, config_path)
 
 
 @asynccontextmanager
@@ -219,5 +215,5 @@ async def validator_from_config(config_path: str) -> AsyncIterator[ValidationCon
         ...     results = await v.validate_directory("./policies")
         ...     v.generate_report(results)
     """
-    fetcher = AWSServiceFetcher()
-    yield ValidationContext(fetcher, config_path=config_path)
+    async with AWSServiceFetcher() as fetcher:
+        yield ValidationContext(fetcher, config_path=config_path)

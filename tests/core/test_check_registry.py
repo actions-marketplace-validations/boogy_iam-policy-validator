@@ -77,6 +77,34 @@ class IssueGeneratingCheck(PolicyCheck):
         ]
 
 
+class MultiSeverityCheck(PolicyCheck):
+    """Mock check that generates issues with different severities."""
+
+    def __init__(self, check_id="multi_severity_check"):
+        self._check_id = check_id
+
+    @property
+    def check_id(self) -> str:
+        return self._check_id
+
+    @property
+    def description(self) -> str:
+        return "Generates issues with multiple severities"
+
+    async def execute(self, statement, statement_idx, fetcher, config):
+        """Generate mock issues with different severities."""
+        severities = ["low", "medium", "high", "critical"]
+        return [
+            ValidationIssue(
+                severity=sev,
+                statement_index=statement_idx,
+                issue_type=f"test_issue_{sev}",
+                message=f"Test {sev} issue",
+            )
+            for sev in severities
+        ]
+
+
 class TestCheckConfig:
     """Test the CheckConfig dataclass."""
 
@@ -89,6 +117,7 @@ class TestCheckConfig:
         assert config.severity is None
         assert config.config == {}
         assert config.description == ""
+        assert config.hide_severities is None
 
     def test_custom_values(self):
         """Test CheckConfig with custom values."""
@@ -106,6 +135,67 @@ class TestCheckConfig:
         assert config.severity == "error"
         assert config.config == custom_config
         assert config.description == "A test check"
+
+
+class TestSeverityFiltering:
+    """Test the severity filtering functionality in CheckConfig."""
+
+    def test_no_filtering_by_default(self):
+        """Without config, all severities should be shown."""
+        config = CheckConfig(check_id="test")
+        assert config.should_show_severity("low") is True
+        assert config.should_show_severity("info") is True
+        assert config.should_show_severity("medium") is True
+        assert config.should_show_severity("high") is True
+        assert config.should_show_severity("critical") is True
+        assert config.should_show_severity("warning") is True
+        assert config.should_show_severity("error") is True
+
+    def test_hide_severities_single(self):
+        """hide_severities should hide a single specified severity."""
+        config = CheckConfig(check_id="test", hide_severities=frozenset(["low"]))
+        assert config.should_show_severity("low") is False
+        assert config.should_show_severity("medium") is True
+        assert config.should_show_severity("high") is True
+        assert config.should_show_severity("critical") is True
+
+    def test_hide_severities_multiple(self):
+        """hide_severities should hide multiple specified severities."""
+        config = CheckConfig(check_id="test", hide_severities=frozenset(["low", "info"]))
+        assert config.should_show_severity("low") is False
+        assert config.should_show_severity("info") is False
+        assert config.should_show_severity("medium") is True
+        assert config.should_show_severity("high") is True
+        assert config.should_show_severity("critical") is True
+        assert config.should_show_severity("warning") is True
+
+    def test_hide_all_except_critical(self):
+        """Can hide all severities except critical."""
+        config = CheckConfig(
+            check_id="test",
+            hide_severities=frozenset(["high", "medium", "low", "info", "warning", "error"]),
+        )
+        assert config.should_show_severity("critical") is True
+        assert config.should_show_severity("high") is False
+        assert config.should_show_severity("medium") is False
+        assert config.should_show_severity("low") is False
+        assert config.should_show_severity("info") is False
+        assert config.should_show_severity("warning") is False
+        assert config.should_show_severity("error") is False
+
+    def test_empty_hide_severities_shows_all(self):
+        """Empty hide_severities frozenset should show all severities."""
+        config = CheckConfig(check_id="test", hide_severities=frozenset())
+        assert config.should_show_severity("critical") is True
+        assert config.should_show_severity("low") is True
+        assert config.should_show_severity("info") is True
+
+    def test_none_hide_severities_shows_all(self):
+        """None hide_severities (default) should show all severities."""
+        config = CheckConfig(check_id="test", hide_severities=None)
+        assert config.should_show_severity("critical") is True
+        assert config.should_show_severity("low") is True
+        assert config.should_show_severity("info") is True
 
 
 class TestPolicyCheck:
@@ -325,9 +415,7 @@ class TestCheckRegistry:
         registry.register(check2)
 
         # Disable check2 and set custom severity
-        registry.configure_check(
-            "check2", CheckConfig(check_id="check2", enabled=False, severity="error")
-        )
+        registry.configure_check("check2", CheckConfig(check_id="check2", enabled=False, severity="error"))
 
         checks_list = registry.list_checks()
 
@@ -343,9 +431,7 @@ class TestCheckRegistry:
         assert issues == []
 
     @pytest.mark.asyncio
-    async def test_execute_checks_parallel_with_issues(
-        self, registry, mock_statement, mock_fetcher
-    ):
+    async def test_execute_checks_parallel_with_issues(self, registry, mock_statement, mock_fetcher):
         """Test parallel execution that generates issues."""
         check = IssueGeneratingCheck(num_issues=2)
         registry.register(check)
@@ -356,9 +442,7 @@ class TestCheckRegistry:
         assert all(isinstance(i, ValidationIssue) for i in issues)
 
     @pytest.mark.asyncio
-    async def test_execute_checks_parallel_with_failing_check(
-        self, registry, mock_statement, mock_fetcher
-    ):
+    async def test_execute_checks_parallel_with_failing_check(self, registry, mock_statement, mock_fetcher):
         """Test parallel execution handles failing checks gracefully."""
         failing = FailingCheck()
         working = IssueGeneratingCheck(num_issues=1)
@@ -373,9 +457,7 @@ class TestCheckRegistry:
         assert len(issues) == 1
 
     @pytest.mark.asyncio
-    async def test_execute_checks_parallel_disabled_checks_skipped(
-        self, registry, mock_statement, mock_fetcher
-    ):
+    async def test_execute_checks_parallel_disabled_checks_skipped(self, registry, mock_statement, mock_fetcher):
         """Test that disabled checks are not executed."""
         check1 = IssueGeneratingCheck(num_issues=1, check_id="issue_check")
         check2 = IssueGeneratingCheck(num_issues=1, check_id="issue_check2")
@@ -402,9 +484,7 @@ class TestCheckRegistry:
         assert len(issues) == 2
 
     @pytest.mark.asyncio
-    async def test_execute_checks_sequential_handles_failures(
-        self, registry, mock_statement, mock_fetcher
-    ):
+    async def test_execute_checks_sequential_handles_failures(self, registry, mock_statement, mock_fetcher):
         """Test sequential execution handles failures gracefully."""
         failing = FailingCheck()
         working = IssueGeneratingCheck(num_issues=1)
@@ -438,6 +518,89 @@ class TestCheckRegistry:
         issues = await registry.execute_checks_parallel(mock_statement, 0, mock_fetcher)
 
         assert len(issues) == 1
+
+    @pytest.mark.asyncio
+    async def test_severity_filtering_hides_low(self, mock_statement, mock_fetcher):
+        """Test that hide_severities filters out low severity issues."""
+        registry = CheckRegistry(enable_parallel=True)
+        check = MultiSeverityCheck()
+        registry.register(check)
+
+        # Configure to hide low severity
+        registry.configure_check(
+            "multi_severity_check",
+            CheckConfig(
+                check_id="multi_severity_check",
+                enabled=True,
+                hide_severities=frozenset(["low"]),
+            ),
+        )
+
+        issues = await registry.execute_checks_parallel(mock_statement, 0, mock_fetcher)
+
+        # Should get 3 issues (medium, high, critical) - low is filtered out
+        assert len(issues) == 3
+        assert all(issue.severity != "low" for issue in issues)
+
+    @pytest.mark.asyncio
+    async def test_severity_filtering_hides_multiple(self, mock_statement, mock_fetcher):
+        """Test that hide_severities filters out multiple severities."""
+        registry = CheckRegistry(enable_parallel=True)
+        check = MultiSeverityCheck()
+        registry.register(check)
+
+        # Configure to hide low and medium severities
+        registry.configure_check(
+            "multi_severity_check",
+            CheckConfig(
+                check_id="multi_severity_check",
+                enabled=True,
+                hide_severities=frozenset(["low", "medium"]),
+            ),
+        )
+
+        issues = await registry.execute_checks_parallel(mock_statement, 0, mock_fetcher)
+
+        # Should get 2 issues (high, critical)
+        assert len(issues) == 2
+        assert all(issue.severity in ("high", "critical") for issue in issues)
+
+    @pytest.mark.asyncio
+    async def test_severity_filtering_no_filter_shows_all(self, mock_statement, mock_fetcher):
+        """Test that without hide_severities all issues are shown."""
+        registry = CheckRegistry(enable_parallel=True)
+        check = MultiSeverityCheck()
+        registry.register(check)
+
+        issues = await registry.execute_checks_parallel(mock_statement, 0, mock_fetcher)
+
+        # Should get all 4 issues
+        assert len(issues) == 4
+        severities = {issue.severity for issue in issues}
+        assert severities == {"low", "medium", "high", "critical"}
+
+    @pytest.mark.asyncio
+    async def test_severity_filtering_sequential_path(self, mock_statement, mock_fetcher):
+        """Test that severity filtering works in sequential execution path."""
+        registry = CheckRegistry(enable_parallel=False)  # Force sequential
+        check = MultiSeverityCheck()
+        registry.register(check)
+
+        # Configure to hide low severity
+        registry.configure_check(
+            "multi_severity_check",
+            CheckConfig(
+                check_id="multi_severity_check",
+                enabled=True,
+                hide_severities=frozenset(["low"]),
+            ),
+        )
+
+        issues = await registry.execute_checks_parallel(mock_statement, 0, mock_fetcher)
+
+        # Should get 3 issues (medium, high, critical)
+        assert len(issues) == 3
+        assert all(issue.severity != "low" for issue in issues)
 
 
 class TestCreateDefaultRegistry:

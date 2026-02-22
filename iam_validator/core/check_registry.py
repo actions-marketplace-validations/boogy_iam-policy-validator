@@ -10,16 +10,42 @@ This module provides a pluggable check system that allows:
 """
 
 import asyncio
+import logging
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from iam_validator.core.aws_service import AWSServiceFetcher
+from iam_validator.core.config.check_documentation import CheckDocumentationRegistry
 from iam_validator.core.ignore_patterns import IgnorePatternMatcher
 from iam_validator.core.models import Statement, ValidationIssue
 
 if TYPE_CHECKING:
     from iam_validator.core.models import IAMPolicy
+
+logger = logging.getLogger(__name__)
+
+
+def _inject_documentation(issue: ValidationIssue, check_id: str) -> None:
+    """Inject documentation fields from CheckDocumentationRegistry into an issue.
+
+    This populates risk_explanation, documentation_url, remediation_steps, and
+    risk_category from the centralized documentation registry if not already set.
+
+    Args:
+        issue: The validation issue to enhance
+        check_id: The check ID to look up documentation for
+    """
+    doc = CheckDocumentationRegistry.get(check_id)
+    if doc:
+        if issue.risk_explanation is None:
+            issue.risk_explanation = doc.risk_explanation
+        if issue.documentation_url is None:
+            issue.documentation_url = doc.documentation_url
+        if issue.remediation_steps is None:
+            issue.remediation_steps = doc.remediation_steps
+        if issue.risk_category is None:
+            issue.risk_category = doc.risk_category
 
 
 @dataclass
@@ -32,27 +58,52 @@ class CheckConfig:
     config: dict[str, Any] = field(default_factory=dict)  # Check-specific config
     description: str = ""
     root_config: dict[str, Any] = field(default_factory=dict)  # Full config for cross-check access
-    ignore_patterns: list[dict[str, Any]] = field(default_factory=list)  # NEW: Ignore patterns
+    ignore_patterns: list[dict[str, Any]] = field(default_factory=list)  # Ignore patterns
+    hide_severities: frozenset[str] | None = None  # Severities to hide from output
     """
-    List of patterns to ignore findings.
+    Configuration fields:
 
-    Each pattern is a dict with optional fields:
-    - filepath: Regex to match file path
-    - action: Regex to match action name
-    - resource: Regex to match resource
-    - sid: Exact SID to match (or regex if ends with .*)
-    - condition_key: Regex to match condition key
+    ignore_patterns: List of patterns to ignore findings.
+        Each pattern is a dict with optional fields:
+        - filepath: Regex to match file path
+        - action: Regex to match action name
+        - resource: Regex to match resource
+        - sid: Exact SID to match (or regex if ends with .*)
+        - condition_key: Regex to match condition key
 
-    Multiple fields in one pattern = AND logic
-    Multiple patterns = OR logic (any pattern matches → ignore)
+        Multiple fields in one pattern = AND logic
+        Multiple patterns = OR logic (any pattern matches → ignore)
 
-    Example:
-        ignore_patterns:
-          - filepath: "test/.*|examples/.*"
-          - filepath: "policies/readonly-.*"
-            action: ".*:(Get|List|Describe).*"
-          - sid: "AllowReadOnlyAccess"
+        Example:
+            ignore_patterns:
+              - filepath: "test/.*|examples/.*"
+              - filepath: "policies/readonly-.*"
+                action: ".*:(Get|List|Describe).*"
+              - sid: "AllowReadOnlyAccess"
+
+    hide_severities: Set of severity levels to hide from output.
+        Issues with these severities will be filtered out and not shown
+        in any output (console, JSON, SARIF, GitHub PR comments, etc.).
+
+        Example:
+            hide_severities: frozenset(["low", "info"])
     """
+
+    def should_show_severity(self, severity: str) -> bool:
+        """Check if a severity level should be shown in output.
+
+        Returns False if severity is in hide_severities, True otherwise.
+        This is used to filter out low-priority findings to reduce noise.
+
+        Args:
+            severity: The severity level to check
+
+        Returns:
+            True if the severity should be shown, False if it should be hidden
+        """
+        if self.hide_severities and severity in self.hide_severities:
+            return False
+        return True
 
     def should_ignore(self, issue: ValidationIssue, filepath: str = "") -> bool:
         """
@@ -391,6 +442,37 @@ class CheckRegistry:
             )
         return result
 
+    def _process_issues(
+        self,
+        issues: list[ValidationIssue],
+        check: PolicyCheck,
+        config: CheckConfig,
+        filepath: str = "",
+    ) -> list[ValidationIssue]:
+        """Inject metadata and filter issues from a check execution.
+
+        Applies check_id injection, documentation enrichment, ignore_patterns
+        filtering, and severity visibility filtering.
+
+        Args:
+            issues: Raw issues from a check execution
+            check: The check that produced the issues
+            config: Configuration for the check
+            filepath: Path to the policy file (for ignore_patterns)
+
+        Returns:
+            Filtered issues with check_id and documentation injected
+        """
+        for issue in issues:
+            if issue.check_id is None:
+                issue.check_id = check.check_id
+            _inject_documentation(issue, check.check_id)
+        return [
+            issue
+            for issue in issues
+            if not config.should_ignore(issue, filepath) and config.should_show_severity(issue.severity)
+        ]
+
     async def execute_checks_parallel(
         self,
         statement: Statement,
@@ -425,49 +507,32 @@ class CheckRegistry:
                 config = self.get_config(check.check_id)
                 if config:
                     issues = await check.execute(statement, statement_idx, fetcher, config)
-                    # Inject check_id into each issue
-                    for issue in issues:
-                        if issue.check_id is None:
-                            issue.check_id = check.check_id
-                    # Filter issues based on ignore_patterns
-                    filtered_issues = [
-                        issue for issue in issues if not config.should_ignore(issue, filepath)
-                    ]
-                    all_issues.extend(filtered_issues)
+                    all_issues.extend(self._process_issues(issues, check, config, filepath))
             return all_issues
 
         # Execute all checks in parallel
         tasks = []
+        task_checks = []
         configs = []
         for check in enabled_checks:
             config = self.get_config(check.check_id)
             if config:
                 task = check.execute(statement, statement_idx, fetcher, config)
                 tasks.append(task)
+                task_checks.append(check)
                 configs.append(config)
 
         # Wait for all checks to complete
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Collect all issues, handling any exceptions and applying ignore_patterns
+        # Collect all issues, handling any exceptions and applying filters
         all_issues = []
         for idx, result in enumerate(results):
             if isinstance(result, Exception):
                 # Log error but continue with other checks
-                check = enabled_checks[idx]
-                print(f"Warning: Check '{check.check_id}' failed: {result}")
+                logger.warning("Check '%s' failed: %s", task_checks[idx].check_id, result)
             elif isinstance(result, list):
-                check = enabled_checks[idx]
-                config = configs[idx]
-                # Inject check_id into each issue
-                for issue in result:
-                    if issue.check_id is None:
-                        issue.check_id = check.check_id
-                # Filter issues based on ignore_patterns
-                filtered_issues = [
-                    issue for issue in result if not config.should_ignore(issue, filepath)
-                ]
-                all_issues.extend(filtered_issues)
+                all_issues.extend(self._process_issues(result, task_checks[idx], configs[idx], filepath))
 
         return all_issues
 
@@ -476,6 +541,7 @@ class CheckRegistry:
         statement: Statement,
         statement_idx: int,
         fetcher: AWSServiceFetcher,
+        filepath: str = "",
     ) -> list[ValidationIssue]:
         """
         Execute all enabled checks sequentially.
@@ -486,6 +552,7 @@ class CheckRegistry:
             statement: The IAM policy statement to validate
             statement_idx: Index of the statement in the policy
             fetcher: AWS service fetcher for API calls
+            filepath: Path to the policy file (for ignore_patterns filtering)
 
         Returns:
             List of all ValidationIssue objects from all checks
@@ -498,9 +565,9 @@ class CheckRegistry:
             if config:
                 try:
                     issues = await check.execute(statement, statement_idx, fetcher, config)
-                    all_issues.extend(issues)
-                except Exception as e:
-                    print(f"Warning: Check '{check.check_id}' failed: {e}")
+                    all_issues.extend(self._process_issues(issues, check, config, filepath))
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    logger.warning("Check '%s' failed: %s", check.check_id, e)
 
         return all_issues
 
@@ -551,19 +618,9 @@ class CheckRegistry:
                             policy_type=policy_type,
                             **kwargs,
                         )
-                        # Inject check_id into each issue
-                        for issue in issues:
-                            if issue.check_id is None:
-                                issue.check_id = check.check_id
-                        # Filter issues based on ignore_patterns
-                        filtered_issues = [
-                            issue
-                            for issue in issues
-                            if not config.should_ignore(issue, policy_file)
-                        ]
-                        all_issues.extend(filtered_issues)
-                    except Exception as e:
-                        print(f"Warning: Check '{check.check_id}' failed: {e}")
+                        all_issues.extend(self._process_issues(issues, check, config, policy_file))
+                    except Exception as e:  # pylint: disable=broad-exception-caught
+                        logger.warning("Check '%s' failed: %s", check.check_id, e)
             return all_issues
 
         # Execute all policy-level checks in parallel
@@ -572,40 +629,28 @@ class CheckRegistry:
         for check in policy_level_checks:
             config = self.get_config(check.check_id)
             if config:
-                task = check.execute_policy(
-                    policy, policy_file, fetcher, config, policy_type=policy_type, **kwargs
-                )
+                task = check.execute_policy(policy, policy_file, fetcher, config, policy_type=policy_type, **kwargs)
                 tasks.append(task)
                 configs.append(config)
 
         # Wait for all checks to complete
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Collect all issues, handling any exceptions and applying ignore_patterns
+        # Collect all issues, handling any exceptions and applying filters
         for idx, result in enumerate(results):
             if isinstance(result, Exception):
                 # Log error but continue with other checks
                 check = policy_level_checks[idx]
-                print(f"Warning: Check '{check.check_id}' failed: {result}")
+                logger.warning("Check '%s' failed: %s", check.check_id, result)
             elif isinstance(result, list):
                 check = policy_level_checks[idx]
                 config = configs[idx]
-                # Inject check_id into each issue
-                for issue in result:
-                    if issue.check_id is None:
-                        issue.check_id = check.check_id
-                # Filter issues based on ignore_patterns
-                filtered_issues = [
-                    issue for issue in result if not config.should_ignore(issue, policy_file)
-                ]
-                all_issues.extend(filtered_issues)
+                all_issues.extend(self._process_issues(result, check, config, policy_file))
 
         return all_issues
 
 
-def create_default_registry(
-    enable_parallel: bool = True, include_builtin_checks: bool = True
-) -> CheckRegistry:
+def create_default_registry(enable_parallel: bool = True, include_builtin_checks: bool = True) -> CheckRegistry:
     """
     Create a registry with all built-in checks registered.
 
@@ -623,7 +668,7 @@ def create_default_registry(
 
     if include_builtin_checks:
         # Import and register built-in checks
-        from iam_validator import checks
+        from iam_validator import checks  # pylint: disable=import-outside-toplevel
 
         # 0. FUNDAMENTAL STRUCTURE (Must run FIRST - validates basic policy structure)
         registry.register(
@@ -631,9 +676,7 @@ def create_default_registry(
         )  # Policy-level: Validates required fields, conflicts, valid values
 
         # 1. POLICY STRUCTURE (Checks that examine the entire policy, not individual statements)
-        registry.register(
-            checks.SidUniquenessCheck()
-        )  # Policy-level: Duplicate SID detection across statements
+        registry.register(checks.SidUniquenessCheck())  # Policy-level: Duplicate SID detection across statements
         registry.register(checks.PolicySizeCheck())  # Policy-level: Size limit validation
 
         # 2. IAM VALIDITY (AWS syntax validation - must pass before deeper checks)
@@ -644,17 +687,18 @@ def create_default_registry(
         # 3. TYPE VALIDATION (Condition operator type checking)
         registry.register(checks.ConditionTypeMismatchCheck())  # Operator-value type compatibility
         registry.register(checks.SetOperatorValidationCheck())  # ForAllValues/ForAnyValue usage
+        registry.register(checks.IfExistsConditionCheck())  # IfExists usage validation
 
         # 4. RESOURCE MATCHING (Action-resource relationship validation)
-        registry.register(
-            checks.ActionResourceMatchingCheck()
-        )  # ARN type matching and resource constraints
+        registry.register(checks.ActionResourceMatchingCheck())  # ARN type matching and resource constraints
 
         # 5. SECURITY - WILDCARDS (Security best practices for wildcards)
         registry.register(checks.WildcardActionCheck())  # Wildcard action detection
         registry.register(checks.WildcardResourceCheck())  # Wildcard resource detection
         registry.register(checks.FullWildcardCheck())  # Full wildcard (*) detection
         registry.register(checks.ServiceWildcardCheck())  # Service-level wildcard detection
+        registry.register(checks.NotActionNotResourceCheck())  # NotAction/NotResource pattern detection
+        registry.register(checks.NotPrincipalValidationCheck())  # NotPrincipal usage detection
 
         # 6. SECURITY - ADVANCED (Sensitive actions and condition enforcement)
         registry.register(
@@ -666,12 +710,8 @@ def create_default_registry(
         registry.register(checks.MFAConditionCheck())  # MFA anti-pattern detection
 
         # 7. PRINCIPAL VALIDATION (Resource policy specific)
-        registry.register(
-            checks.PrincipalValidationCheck()
-        )  # Principal validation (resource policies)
-        registry.register(
-            checks.TrustPolicyValidationCheck()
-        )  # Trust policy validation (role assumption policies)
+        registry.register(checks.PrincipalValidationCheck())  # Principal validation (resource policies)
+        registry.register(checks.TrustPolicyValidationCheck())  # Trust policy validation (role assumption policies)
 
         # Note: policy_type_validation is a standalone function (not a class-based check)
         # and is called separately in the validation flow

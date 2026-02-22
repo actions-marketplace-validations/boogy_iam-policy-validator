@@ -10,7 +10,10 @@ from iam_validator.checks.action_validation import ActionValidationCheck
 from iam_validator.checks.condition_key_validation import ConditionKeyValidationCheck
 from iam_validator.checks.condition_type_mismatch import ConditionTypeMismatchCheck
 from iam_validator.checks.full_wildcard import FullWildcardCheck
+from iam_validator.checks.ifexists_condition_check import IfExistsConditionCheck
 from iam_validator.checks.mfa_condition_check import MFAConditionCheck
+from iam_validator.checks.not_action_not_resource import NotActionNotResourceCheck
+from iam_validator.checks.not_principal_validation import NotPrincipalValidationCheck
 from iam_validator.checks.policy_size import PolicySizeCheck
 from iam_validator.checks.policy_structure import PolicyStructureCheck
 from iam_validator.checks.principal_validation import PrincipalValidationCheck
@@ -30,7 +33,10 @@ __all__ = [
     "ConditionKeyValidationCheck",
     "ConditionTypeMismatchCheck",
     "FullWildcardCheck",
+    "IfExistsConditionCheck",
     "MFAConditionCheck",
+    "NotActionNotResourceCheck",
+    "NotPrincipalValidationCheck",
     "PolicySizeCheck",
     "PolicyStructureCheck",
     "PrincipalValidationCheck",

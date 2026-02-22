@@ -77,9 +77,7 @@ def normalize_policy(policy: IAMPolicy) -> IAMPolicy:
         action = [stmt.action] if isinstance(stmt.action, str) else stmt.action
         resource = [stmt.resource] if isinstance(stmt.resource, str) else stmt.resource
         not_action = [stmt.not_action] if isinstance(stmt.not_action, str) else stmt.not_action
-        not_resource = (
-            [stmt.not_resource] if isinstance(stmt.not_resource, str) else stmt.not_resource
-        )
+        not_resource = [stmt.not_resource] if isinstance(stmt.not_resource, str) else stmt.not_resource
 
         # Create a new statement with normalized fields
         # Use capitalized field names (aliases) for Pydantic model construction
@@ -168,12 +166,40 @@ def extract_resources(policy: IAMPolicy) -> list[str]:
 
         # Handle NotResource field
         if stmt.not_resource:
-            not_resources = (
-                [stmt.not_resource] if isinstance(stmt.not_resource, str) else stmt.not_resource
-            )
+            not_resources = [stmt.not_resource] if isinstance(stmt.not_resource, str) else stmt.not_resource
             resources.update(not_resources)
 
     return sorted(resources)
+
+
+def extract_condition_keys_from_statement(statement: Statement) -> set[str]:
+    """
+    Extract all condition keys from a single statement.
+
+    Args:
+        statement: Statement to extract condition keys from
+
+    Returns:
+        Set of condition key names (e.g., {"aws:ResourceAccount", "aws:SourceIp"})
+
+    Example:
+        >>> stmt = Statement(
+        ...     Effect="Allow",
+        ...     Action=["s3:GetObject"],
+        ...     Resource=["*"],
+        ...     Condition={"StringEquals": {"aws:ResourceAccount": "123456789012"}}
+        ... )
+        >>> keys = extract_condition_keys_from_statement(stmt)
+        >>> print(keys)  # {"aws:ResourceAccount"}
+    """
+    if not statement.condition:
+        return set()
+
+    keys: set[str] = set()
+    for operator_block in statement.condition.values():
+        if isinstance(operator_block, dict):
+            keys.update(operator_block.keys())
+    return keys
 
 
 def extract_condition_keys(policy: IAMPolicy) -> list[str]:
@@ -197,11 +223,7 @@ def extract_condition_keys(policy: IAMPolicy) -> list[str]:
         return []
 
     for stmt in policy.statement:
-        if stmt.condition:
-            # Condition format: {"StringEquals": {"aws:username": "johndoe"}}
-            for _, key_values in stmt.condition.items():
-                if isinstance(key_values, dict):
-                    condition_keys.update(key_values.keys())
+        condition_keys.update(extract_condition_keys_from_statement(stmt))
 
     return sorted(condition_keys)
 

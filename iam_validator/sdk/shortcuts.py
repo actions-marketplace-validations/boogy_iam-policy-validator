@@ -5,9 +5,9 @@ This module provides high-level, easy-to-use functions for common IAM policy
 validation tasks without requiring deep knowledge of the internal API.
 """
 
+import json
 from pathlib import Path
 
-from iam_validator.core.config.config_loader import ValidatorConfig
 from iam_validator.core.models import PolicyValidationResult, ValidationIssue
 from iam_validator.core.policy_checks import validate_policies
 from iam_validator.core.policy_loader import PolicyLoader
@@ -16,7 +16,6 @@ from iam_validator.core.policy_loader import PolicyLoader
 async def validate_file(
     file_path: str | Path,
     config_path: str | None = None,
-    config: ValidatorConfig | None = None,
 ) -> PolicyValidationResult:
     """
     Validate a single IAM policy file.
@@ -24,7 +23,6 @@ async def validate_file(
     Args:
         file_path: Path to the policy file (JSON or YAML)
         config_path: Optional path to configuration file
-        config: Optional ValidatorConfig object (overrides config_path)
 
     Returns:
         PolicyValidationResult for the policy
@@ -62,7 +60,6 @@ async def validate_file(
 async def validate_directory(
     dir_path: str | Path,
     config_path: str | None = None,
-    config: ValidatorConfig | None = None,
     recursive: bool = True,
 ) -> list[PolicyValidationResult]:
     """
@@ -71,7 +68,6 @@ async def validate_directory(
     Args:
         dir_path: Path to directory containing policy files
         config_path: Optional path to configuration file
-        config: Optional ValidatorConfig object (overrides config_path)
         recursive: Whether to search subdirectories (default: True)
 
     Returns:
@@ -83,7 +79,7 @@ async def validate_directory(
         >>> print(f"{valid_count}/{len(results)} policies are valid")
     """
     loader = PolicyLoader()
-    policies = loader.load_from_path(str(dir_path))
+    policies = loader.load_from_path(str(dir_path), recursive=recursive)
 
     if not policies:
         raise ValueError(f"No IAM policies found in {dir_path}")
@@ -95,22 +91,24 @@ async def validate_directory(
 
 
 async def validate_json(
-    policy_json: dict,
+    policy_json: dict | str,
     policy_name: str = "inline-policy",
     config_path: str | None = None,
-    config: ValidatorConfig | None = None,
 ) -> PolicyValidationResult:
     """
-    Validate an IAM policy from a Python dictionary.
+    Validate an IAM policy from a Python dictionary or JSON string.
 
     Args:
-        policy_json: IAM policy as a Python dict
+        policy_json: IAM policy as a Python dict or JSON string
         policy_name: Name to identify this policy in results
         config_path: Optional path to configuration file
-        config: Optional ValidatorConfig object (overrides config_path)
 
     Returns:
         PolicyValidationResult for the policy
+
+    Raises:
+        json.JSONDecodeError: If a string is provided that is not valid JSON
+        TypeError: If policy_json is not a dict or str
 
     Example:
         >>> policy = {
@@ -123,8 +121,19 @@ async def validate_json(
         ... }
         >>> result = await validate_json(policy)
         >>> print(f"Valid: {result.is_valid}")
+
+        >>> # Also accepts JSON strings:
+        >>> result = await validate_json('{"Version": "2012-10-17", ...}')
     """
     from iam_validator.core.models import IAMPolicy
+
+    # Parse string input to dict
+    if isinstance(policy_json, str):
+        parsed = json.loads(policy_json)
+        if not isinstance(parsed, dict):
+            msg = f"Expected JSON object, got {type(parsed).__name__}"
+            raise TypeError(msg)
+        policy_json = parsed
 
     # Parse the dict into an IAMPolicy
     policy = IAMPolicy(**policy_json)
@@ -148,7 +157,6 @@ async def validate_json(
 async def quick_validate(
     policy: str | Path | dict,
     config_path: str | None = None,
-    config: ValidatorConfig | None = None,
 ) -> bool:
     """
     Quick validation returning just True/False.
@@ -158,7 +166,6 @@ async def quick_validate(
     Args:
         policy: File path, directory path, or policy dict
         config_path: Optional path to configuration file
-        config: Optional ValidatorConfig object (overrides config_path)
 
     Returns:
         True if all policies are valid, False otherwise
@@ -194,7 +201,6 @@ async def get_issues(
     policy: str | Path | dict,
     min_severity: str = "medium",
     config_path: str | None = None,
-    config: ValidatorConfig | None = None,
 ) -> list[ValidationIssue]:
     """
     Get just the issues from validation, filtered by severity.
@@ -203,7 +209,6 @@ async def get_issues(
         policy: File path, directory path, or policy dict
         min_severity: Minimum severity to include (critical, high, medium, low, info)
         config_path: Optional path to configuration file
-        config: Optional ValidatorConfig object (overrides config_path)
 
     Returns:
         List of ValidationIssues meeting the severity threshold
@@ -213,18 +218,7 @@ async def get_issues(
         >>> for issue in issues:
         ...     print(f"{issue.severity}: {issue.message}")
     """
-    # Severity ranking for filtering
-    severity_rank = {
-        "critical": 5,
-        "high": 4,
-        "medium": 3,
-        "low": 2,
-        "info": 1,
-        "warning": 3,  # Treat warning as medium
-        "error": 4,  # Treat error as high
-    }
-
-    min_rank = severity_rank.get(min_severity.lower(), 0)
+    min_rank = ValidationIssue.SEVERITY_RANK.get(min_severity.lower(), 0)
 
     # Get validation results
     if isinstance(policy, dict):
@@ -242,17 +236,62 @@ async def get_issues(
     all_issues = []
     for result in results:
         for issue in result.issues:
-            issue_rank = severity_rank.get(issue.severity.lower(), 0)
+            issue_rank = ValidationIssue.SEVERITY_RANK.get(issue.severity.lower(), 0)
             if issue_rank >= min_rank:
                 all_issues.append(issue)
 
     return all_issues
 
 
+def filter_issues_by_check_id(
+    result: PolicyValidationResult,
+    check_id: str,
+) -> list[ValidationIssue]:
+    """Filter validation issues by check ID.
+
+    Args:
+        result: PolicyValidationResult to filter
+        check_id: Check ID to filter by (e.g., "wildcard_action", "sensitive_action")
+
+    Returns:
+        List of ValidationIssues matching the check ID
+
+    Example:
+        >>> result = await validate_file("policy.json")
+        >>> wildcard_issues = filter_issues_by_check_id(result, "wildcard_action")
+        >>> print(f"Found {len(wildcard_issues)} wildcard action issues")
+    """
+    return [issue for issue in result.issues if issue.check_id == check_id]
+
+
+def filter_issues_by_severity(
+    result: PolicyValidationResult,
+    min_severity: str = "medium",
+) -> list[ValidationIssue]:
+    """Filter validation issues by minimum severity threshold.
+
+    Uses the severity ranking from :class:`ValidationIssue.SEVERITY_RANK`.
+
+    Args:
+        result: PolicyValidationResult to filter
+        min_severity: Minimum severity to include. Valid values:
+            "error", "critical", "high", "warning", "medium", "low", "info"
+
+    Returns:
+        List of ValidationIssues at or above the severity threshold
+
+    Example:
+        >>> result = await validate_file("policy.json")
+        >>> high_issues = filter_issues_by_severity(result, "high")
+        >>> print(f"Found {len(high_issues)} high+ severity issues")
+    """
+    min_rank = ValidationIssue.SEVERITY_RANK.get(min_severity, 0)
+    return [issue for issue in result.issues if issue.get_severity_rank() >= min_rank]
+
+
 async def count_issues_by_severity(
     policy: str | Path | dict,
     config_path: str | None = None,
-    config: ValidatorConfig | None = None,
 ) -> dict[str, int]:
     """
     Count issues grouped by severity level.
@@ -260,7 +299,6 @@ async def count_issues_by_severity(
     Args:
         policy: File path, directory path, or policy dict
         config_path: Optional path to configuration file
-        config: Optional ValidatorConfig object (overrides config_path)
 
     Returns:
         Dictionary mapping severity levels to counts

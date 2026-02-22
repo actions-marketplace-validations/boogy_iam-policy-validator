@@ -67,10 +67,11 @@ dmypy.json
 temp/
 tmp/
 
-# Claude Code
-CLAUDE.md
-plan.md
-.claude/
+# Claude Code (local-only)
+.claude/settings.local.json
+.claude/plans/
+.claude/agents-sync/
+.claude/agent-reports/
 
 # uv
 .python-version
@@ -84,3 +85,7 @@ coverage.xml
 
 # AWS service definitions (download with: iam-validator download-services)
 aws_services/
+
+.mcp.json
+.serena
+agent-sync/

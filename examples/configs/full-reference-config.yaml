@@ -5,8 +5,8 @@
 # and their default values. Most users won't need this level of customization.
 #
 # For simpler configs, see:
-#   - examples/configs/basic-config.yaml (minimal config)
 #   - examples/configs/strict-security.yaml (production config)
+#   - examples/configs/offline-validation.yaml (air-gapped environments)
 # ============================================================================
 
 # ============================================================================
@@ -159,6 +159,13 @@ settings:
     # - medium  # Uncomment to fail on medium severity
     # - warning  # Uncomment to fail on IAM validity warnings
 
+  # Severity filtering - hide specific severity levels from output
+  # When set, issues with these severities will be filtered out globally
+  # Can be overridden per-check using check-level hide_severities
+  # Valid values: "error", "warning", "info", "critical", "high", "medium", "low"
+  # Example: ["low", "info"] - hide low and info severity findings
+  hide_severities: None
+
   # GitHub PR label mapping based on severity findings
   # When issues with these severities are found, apply the corresponding labels to the PR
   # If no issues with these severities exist, remove the labels if present
@@ -234,7 +241,7 @@ settings:
   allow_template_variables: true
 
 # ============================================================================
-# BUILT-IN CHECKS - AWS Validation (17 checks total)
+# BUILT-IN CHECKS - AWS Validation (22 checks total)
 # ============================================================================
 # These validate that policies conform to AWS requirements
 # Disable all with: settings.enable_builtin_checks: false (useful with Access Analyzer)
@@ -247,7 +254,19 @@ settings:
 # ============================================================================
 
 # ============================================================================
-# 1. SID UNIQUENESS
+# 1. POLICY STRUCTURE
+# ============================================================================
+# Validates fundamental policy structure (must run first)
+# Checks: required fields (Effect, Action/NotAction), valid values,
+# conflicting elements (Action+NotAction, Resource+NotResource, Principal+NotPrincipal)
+policy_structure:
+  enabled: true
+  severity: error
+  description: "Validates basic policy structure including required fields, valid values, and conflicting elements"
+  # ignore_patterns available - see top of file for usage examples
+
+# ============================================================================
+# 2. SID UNIQUENESS
 # ============================================================================
 sid_uniqueness:
   enabled: true
@@ -260,7 +279,7 @@ sid_uniqueness:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 2. POLICY SIZE
+# 3. POLICY SIZE
 # ============================================================================
 policy_size:
   enabled: true
@@ -283,7 +302,7 @@ policy_size:
   #   inline_role: 10240
 
 # ============================================================================
-# 3. ACTION VALIDATION
+# 4. ACTION VALIDATION
 # ============================================================================
 action_validation:
   enabled: true
@@ -292,7 +311,7 @@ action_validation:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 4. CONDITION KEY VALIDATION
+# 5. CONDITION KEY VALIDATION
 # ============================================================================
 condition_key_validation:
   enabled: true
@@ -308,7 +327,7 @@ condition_key_validation:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 5. CONDITION TYPE MISMATCH
+# 6. CONDITION TYPE MISMATCH
 # ============================================================================
 # Validate condition operator types match key types and value formats
 # Checks that:
@@ -326,7 +345,7 @@ condition_type_mismatch:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 6. SET OPERATOR VALIDATION
+# 7. SET OPERATOR VALIDATION
 # ============================================================================
 set_operator_validation:
   enabled: true
@@ -337,7 +356,21 @@ set_operator_validation:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 7. MFA CONDITION ANTIPATTERN
+# 8. IFEXISTS CONDITION USAGE
+# ============================================================================
+# Validates IfExists condition operator usage
+# Detects patterns where IfExists operators may silently skip evaluation:
+#   - IfExists on required condition keys (e.g., aws:MultiFactorAuthPresent with IfExists
+#     allows unauthenticated access when MFA key is absent)
+#   - IfExists that weakens security controls
+ifexists_condition_usage:
+  enabled: true
+  severity: warning
+  description: "Validates IfExists condition operator usage and detects weakened security controls"
+  # ignore_patterns available - see top of file for usage examples
+
+# ============================================================================
+# 9. MFA CONDITION ANTIPATTERN
 # ============================================================================
 # Detect MFA condition anti-patterns
 # Identifies dangerous MFA-related patterns that may not enforce MFA as intended:
@@ -352,7 +385,7 @@ mfa_condition_antipattern:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 8. RESOURCE VALIDATION
+# 10. RESOURCE VALIDATION
 # ============================================================================
 resource_validation:
   enabled: true
@@ -368,77 +401,176 @@ resource_validation:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 9. PRINCIPAL VALIDATION
+# 11. PRINCIPAL VALIDATION
 # ============================================================================
 # Validates Principal elements in resource-based policies
 # Applies to: S3 buckets, SNS topics, SQS queues, Lambda functions, etc.
-# Only runs when: --policy-type RESOURCE_POLICY
+# Runs for: --policy-type RESOURCE_POLICY or TRUST_POLICY
 #
-# Three control mechanisms:
-#   1. blocked_principals: Block specific principals (deny list)
-#   2. allowed_principals: Allow only specific principals (whitelist mode)
-#   3. principal_condition_requirements: Require conditions for certain principals
+# Six control mechanisms:
+#   1. block_wildcard_principal: Strict mode to block "*" entirely
+#   2. block_service_principal_wildcard: Block dangerous {"Service": "*"}
+#   3. blocked_principals: Block specific principals (deny list)
+#   4. allowed_principals: Allow only specific principals (whitelist mode)
+#   5. allowed_service_principals: Control which AWS services are allowed
+#   6. principal_condition_requirements: Require conditions for principals
 #
 principal_validation:
   enabled: true
   severity: high
   description: "Validates Principal elements in resource policies for security best practices"
 
-  # 1. BLOCKED PRINCIPALS (Deny List)
-  # Principals that should NEVER be allowed
-  # Default: ["*"] blocks public access
-  blocked_principals:
-    - "*" # Block public access to everyone
-    # - "arn:aws:iam::*:root"  # Uncomment to block all AWS accounts
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. BLOCK WILDCARD PRINCIPAL (Strict Mode)
+  # ──────────────────────────────────────────────────────────────────────────
+  # Controls how `Principal: "*"` is handled:
+  #
+  #   false (default): Allow "*" but require conditions via principal_condition_requirements
+  #                    Use this for S3 bucket policies, SNS subscriptions, etc. that need
+  #                    public access restricted by aws:SourceArn/aws:SourceAccount
+  #
+  #   true:  Block "*" entirely - strictest option, no conditions checked
+  #          Use this if you never want public principals in your policies
+  #
+  # Example with false (default):
+  #   "Principal": "*",
+  #   "Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"}}
+  #   → Valid if conditions satisfy principal_condition_requirements
+  #
+  # Example with true:
+  #   "Principal": "*"  → Blocked immediately as "blocked_principal"
+  #
+  block_wildcard_principal: false
 
-  # 2. ALLOWED PRINCIPALS (Whitelist Mode)
-  # When set, ONLY these principals are allowed
-  # Leave empty [] to allow all (except blocked)
-  # Examples:
-  #   - "arn:aws:iam::123456789012:root"  # Only your account
-  #   - "arn:aws:iam::*:role/OrgAccessRole"  # Specific role in any account
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. BLOCK SERVICE PRINCIPAL WILDCARDS
+  # ──────────────────────────────────────────────────────────────────────────
+  # Detects dangerous `{"Service": "*"}` patterns in Principal field.
+  # This allows ANY AWS service to access the resource - extremely permissive!
+  #
+  #   true (default): Block {"Service": "*"} - always report as CRITICAL
+  #   false: Allow {"Service": "*"} (not recommended)
+  #
+  # What's detected:
+  #   "Principal": {"Service": "*"}                              ← CRITICAL
+  #   "Principal": {"Service": ["lambda.amazonaws.com", "*"]}    ← CRITICAL
+  #
+  # What's NOT detected (NotPrincipal is different semantics):
+  #   "NotPrincipal": {"Service": "*"}  ← Means "everyone EXCEPT services"
+  #
+  # Why it's dangerous:
+  #   Any AWS service from any account can access your resource.
+  #   Without aws:SourceArn/aws:SourceAccount conditions, attackers could
+  #   use a service in their account to access your resources.
+  #
+  block_service_principal_wildcard: true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. BLOCKED PRINCIPALS (Deny List)
+  # ──────────────────────────────────────────────────────────────────────────
+  # Principals that should NEVER be allowed, regardless of conditions.
+  # Supports glob patterns (e.g., "arn:aws:iam::*:root")
+  #
+  # Note: When block_wildcard_principal is true, "*" is automatically blocked
+  # regardless of this list.
+  #
+  # Default: [] (empty - use block_wildcard_principal for "*")
+  #
+  blocked_principals: []
+    # Examples:
+    # - "*"                        # Block public access (prefer block_wildcard_principal)
+    # - "arn:aws:iam::*:root"      # Block all root account principals
+    # - "arn:aws:iam::999999999999:*"  # Block specific untrusted account
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4. ALLOWED PRINCIPALS (Whitelist Mode)
+  # ──────────────────────────────────────────────────────────────────────────
+  # When set (non-empty), ONLY these principals are allowed.
+  # Principals not in this list trigger "unauthorized_principal" error.
+  # Supports glob patterns.
+  #
+  # Default: [] (empty - allow all principals except blocked)
+  #
+  # Leave empty to allow all principals (except those in blocked_principals).
+  # Set to specific values for strict whitelist mode.
+  #
   allowed_principals: []
+    # Examples:
+    # - "arn:aws:iam::123456789012:root"        # Only your account
+    # - "arn:aws:iam::123456789012:role/*"      # Any role in your account
+    # - "arn:aws:iam::*:role/OrgAccessRole"     # Specific role in any account
 
-  # 3. PRINCIPAL CONDITION REQUIREMENTS
-  # Require specific conditions for certain principals
-  # Supports all_of/any_of/none_of logic like action_condition_enforcement
-  # Default: 2 enabled (public_access, prevent_insecure_transport)
+  # ──────────────────────────────────────────────────────────────────────────
+  # 5. ALLOWED SERVICE PRINCIPALS
+  # ──────────────────────────────────────────────────────────────────────────
+  # AWS service principals (*.amazonaws.com) that are always allowed.
+  #
+  # Default: ["aws:*"] - allows ALL AWS service principals
+  # The special value "aws:*" matches any *.amazonaws.com service.
+  #
+  # Note: "aws:*" is different from "*" (public access).
+  # Service principals like "lambda.amazonaws.com" are AWS infrastructure,
+  # not public internet access.
+  #
+  allowed_service_principals:
+    - "aws:*"  # Allow all AWS services (default)
+    #
+    # Or restrict to specific services:
+    # - "lambda.amazonaws.com"
+    # - "s3.amazonaws.com"
+    # - "sns.amazonaws.com"
+    # - "events.amazonaws.com"
+    # - "cloudfront.amazonaws.com"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 6. PRINCIPAL CONDITION REQUIREMENTS
+  # ──────────────────────────────────────────────────────────────────────────
+  # Require specific conditions when certain principals are used.
+  # Only checked when block_wildcard_principal is false.
+  #
+  # Supports all_of/any_of/none_of logic (like action_condition_enforcement):
+  #   all_of:  ALL conditions must be present
+  #   any_of:  At least ONE condition must be present
+  #   none_of: NONE of these conditions should be present
+  #
+  # Default: 2 requirements enabled from Python config
   # See: iam_validator/core/config/principal_requirements.py
   #
-  # Examples:
   # principal_condition_requirements:
-  #   # Public access must have source restrictions
+  #   # Require source restrictions for public access
   #   - principals: ["*"]
   #     severity: critical
   #     required_conditions:
-  #       any_of:  # At least ONE of these
+  #       any_of:
   #         - condition_key: "aws:SourceArn"
+  #           description: "Restrict to specific source ARN"
   #         - condition_key: "aws:SourceAccount"
+  #           description: "Restrict to specific AWS account"
   #         - condition_key: "aws:SourceVpce"
+  #           description: "Restrict to VPC endpoint"
+  #         - condition_key: "aws:SourceIp"
+  #           description: "Restrict to IP range"
   #
-  #   # Cross-account requires organization membership
+  #   # Require organization membership for cross-account access
   #   - principals: ["arn:aws:iam::*:root"]
   #     severity: high
   #     required_conditions:
-  #       - condition_key: "aws:PrincipalOrgID"
-  #         expected_value: ["o-abc123", "o-def456"]
-
-  # 4. ALLOWED SERVICE PRINCIPALS
-  # AWS service principals that are always allowed
-  # Default: "aws:*" = ALL AWS service principals (*.amazonaws.com)
-  # Note: "aws:*" is different from "*" (public access)
+  #       all_of:
+  #         - condition_key: "aws:PrincipalOrgID"
+  #           expected_value: "o-xxxxx"
+  #           description: "Must be in your organization"
   #
-  # Keep default (allow all AWS services):
-  # allowed_service_principals: ["aws:*"]
-  #
-  # Or restrict to specific services:
-  # allowed_service_principals:
-  #   - "cloudfront.amazonaws.com"
-  #   - "s3.amazonaws.com"
-  #   - "lambda.amazonaws.com"
+  #   # Forbid insecure transport
+  #   - principals: ["*"]
+  #     severity: high
+  #     required_conditions:
+  #       none_of:
+  #         - condition_key: "aws:SecureTransport"
+  #           expected_value: false
+  #           description: "Never allow HTTP (must use HTTPS)"
 
 # ============================================================================
-# 10. TRUST POLICY VALIDATION
+# 12. TRUST POLICY VALIDATION
 # ============================================================================
 # Validates trust policies (role assumption policies) for security best practices
 # Ensures assume role actions have appropriate principals and conditions
@@ -479,7 +611,7 @@ trust_policy_validation:
   #       - "SAML:aud"
 
 # ============================================================================
-# 11. POLICY TYPE VALIDATION
+# 13. POLICY TYPE VALIDATION
 # ============================================================================
 # Validate policy type requirements (new in v1.3.0)
 # Ensures policies conform to the declared type (IDENTITY vs RESOURCE_POLICY)
@@ -495,7 +627,7 @@ policy_type_validation:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 12. ACTION-RESOURCE MATCHING
+# 14. ACTION-RESOURCE MATCHING
 # ============================================================================
 # Resource-Action Matching Check (inspired by Parliament's RESOURCE_MISMATCH)
 # Validates that resources in policy statements match the required resource types for actions
@@ -518,7 +650,7 @@ action_resource_matching:
   #     action: "s3:GetObject"
 
 # ============================================================================
-# Security Best Practices Checks (6 checks)
+# Security Best Practices Checks (7 checks)
 # ============================================================================
 # Individual checks for security anti-patterns
 #
@@ -538,7 +670,7 @@ action_resource_matching:
 # ============================================================================
 
 # ============================================================================
-# 13. WILDCARD ACTION
+# 15. WILDCARD ACTION
 # ============================================================================
 # Check for wildcard actions (Action: "*")
 # Flags statements that allow all actions
@@ -574,7 +706,7 @@ wildcard_action:
   #     resource: "arn:aws:s3:::.*-tfstate.*"
 
 # ============================================================================
-# 14. WILDCARD RESOURCE
+# 16. WILDCARD RESOURCE
 # ============================================================================
 # Check for wildcard resources (Resource: "*")
 # Flags statements that apply to all resources
@@ -657,7 +789,7 @@ wildcard_resource:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 15. FULL WILDCARD (CRITICAL)
+# 17. FULL WILDCARD (CRITICAL)
 # ============================================================================
 # Check for BOTH Action: "*" AND Resource: "*" (CRITICAL)
 # This grants full administrative access (AdministratorAccess equivalent)
@@ -678,7 +810,7 @@ full_wildcard:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 16. SERVICE WILDCARD
+# 18. SERVICE WILDCARD
 # ============================================================================
 # Check for service-level wildcards (e.g., "iam:*", "s3:*", "ec2:*")
 # These grant ALL permissions for a service (often too permissive)
@@ -697,7 +829,7 @@ service_wildcard:
   # ignore_patterns available - see top of file for usage examples
 
 # ============================================================================
-# 17. SENSITIVE ACTION
+# 19. SENSITIVE ACTION
 # ============================================================================
 # Check for sensitive actions without IAM conditions
 # Sensitive actions: credential exposure, data access, privilege escalation, resource exposure
@@ -787,7 +919,7 @@ sensitive_action:
   #       - "^iam:List.*"   # All IAM List actions
 
 # ============================================================================
-# 18. ACTION CONDITION ENFORCEMENT
+# 20. ACTION CONDITION ENFORCEMENT
 # ============================================================================
 # Enforce specific IAM condition requirements for actions
 #
@@ -919,6 +1051,58 @@ action_condition_enforcement:
   #   # Add more requirements as needed...
 #
 #
+# ============================================================================
+# 21. NOT_ACTION_NOT_RESOURCE
+# ============================================================================
+# Check for dangerous NotAction/NotResource patterns in IAM policies
+#
+# NotAction and NotResource are powerful IAM features that can be misused to
+# grant overly broad permissions. This check detects patterns that violate
+# the principle of least privilege.
+#
+# Patterns detected:
+#   1. NotAction with Effect: Allow - grants everything EXCEPT listed actions
+#   2. NotResource with wildcards - grants access to all resources except listed
+#   3. NotAction in Allow without strict conditions - missing safeguards
+#
+# These patterns are particularly dangerous because they grant permissions
+# by exclusion rather than explicit inclusion, making it easy to accidentally
+# grant more access than intended.
+not_action_not_resource:
+  enabled: true
+  severity: high  # Security issue: high severity for unconditioned NotAction
+  description: "Checks for dangerous NotAction/NotResource patterns"
+
+  # Customize messages (optional)
+  # message: "Statement uses NotAction/NotResource pattern"
+  # suggestion: "Consider using explicit Action/Resource lists instead"
+
+  # ignore_patterns available - see top of file for usage examples
+  # Example:
+  # ignore_patterns:
+  #   # Ignore NotAction Deny patterns in permission boundary policies
+  #   - filepath: ".*permission-boundary.*"
+  #     action: ".*"
+
+# ============================================================================
+# 22. NOT_PRINCIPAL VALIDATION
+# ============================================================================
+# Check for NotPrincipal usage patterns in IAM policies
+#
+# NotPrincipal is a powerful but dangerous IAM feature. When used with Allow,
+# it grants access to ALL principals EXCEPT those listed - often unintended.
+# When used with Deny, it exempts listed principals from the denial.
+#
+# Patterns detected:
+#   1. NotPrincipal with Effect: Allow - grants broad access by exclusion
+#   2. NotPrincipal usage in resource policies - may expose resources
+#   3. NotPrincipal without restrictive conditions - missing safeguards
+not_principal_validation:
+  enabled: true
+  severity: warning
+  description: "Checks for NotPrincipal usage patterns that may unintentionally grant broad access"
+  # ignore_patterns available - see top of file for usage examples
+
 # ============================================================================
 # CUSTOM CHECKS - Business Rules
 # ============================================================================

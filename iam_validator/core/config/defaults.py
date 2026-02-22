@@ -16,6 +16,8 @@ Benefits of code-first approach:
 - 5-10x faster than YAML parsing
 """
 
+import copy
+
 from iam_validator.core import constants
 from iam_validator.core.config.category_suggestions import get_category_suggestions
 from iam_validator.core.config.condition_requirements import CONDITION_REQUIREMENTS
@@ -110,6 +112,12 @@ DEFAULT_CONFIG = {
             # Include AWS documentation links alongside org docs
             "include_aws_docs": True,
         },
+        # Severity filtering - hide specific severity levels from output
+        # When set, issues with these severities will be filtered out globally
+        # Can be overridden per-check using check-level hide_severities
+        # Valid values: "error", "warning", "info", "critical", "high", "medium", "low"
+        # Example: ["low", "info"] - hide low and info severity findings
+        "hide_severities": None,
     },
     # ========================================================================
     # AWS IAM Validation Checks (17 checks total)
@@ -232,18 +240,26 @@ DEFAULT_CONFIG = {
     # Applies to: S3 buckets, SNS topics, SQS queues, Lambda functions, etc.
     # Only runs when: --policy-type RESOURCE_POLICY
     #
-    # Three control mechanisms:
-    #   1. blocked_principals - Block specific principals (deny list)
-    #   2. allowed_principals - Allow only specific principals (whitelist mode)
-    #   3. principal_condition_requirements - Require conditions for principals
-    #   4. allowed_service_principals - Always allow AWS service principals
+    # Control mechanisms:
+    #   1. block_wildcard_principal - Simple toggle for wildcard principal handling
+    #   2. blocked_principals - Block specific principals (deny list)
+    #   3. allowed_principals - Allow only specific principals (whitelist mode)
+    #   4. principal_condition_requirements - Require conditions for principals
+    #   5. allowed_service_principals - Always allow AWS service principals
+    #   6. block_service_principal_wildcard - Block {"Service": "*"} patterns
     "principal_validation": {
         "enabled": True,
         "severity": "high",  # Security issue, not IAM validity error
         "description": "Validates Principal elements in resource policies for security best practices",
-        # blocked_principals: Deny list - these principals are never allowed
-        # Default: ["*"] blocks public access
-        "blocked_principals": ["*"],
+        # block_wildcard_principal: Strict mode toggle for Principal: "*"
+        #   false (default): Allow wildcard principal but require conditions
+        #   true: Block wildcard principal entirely - strictest option
+        # When false, principal_condition_requirements for "*" are enforced,
+        # allowing patterns like S3 bucket policies with aws:SourceArn conditions.
+        "block_wildcard_principal": False,
+        # blocked_principals: Deny list - additional principals to block
+        # Note: When block_wildcard_principal is true, "*" is automatically blocked.
+        "blocked_principals": [],
         # allowed_principals: Whitelist mode - when set, ONLY these are allowed
         # Default: [] allows all (except blocked)
         "allowed_principals": [],
@@ -256,6 +272,12 @@ DEFAULT_CONFIG = {
         # Default: ["aws:*"] allows ALL AWS service principals
         # Note: "aws:*" is different from "*" (public access)
         "allowed_service_principals": ["aws:*"],
+        # block_service_principal_wildcard: Block {"Service": "*"} in Principal
+        # This pattern allows ANY AWS service to access the resource, which is
+        # extremely permissive. Without source verification conditions like
+        # aws:SourceArn or aws:SourceAccount, this creates a security risk.
+        # Default: True (always block this dangerous pattern)
+        "block_service_principal_wildcard": True,
     },
     # ========================================================================
     # 10. TRUST POLICY VALIDATION
@@ -709,7 +731,7 @@ DEFAULT_CONFIG = {
         # CRITICAL: This key is used by sensitive_action check for filtering
         # It must be named "requirements" (not "action_condition_requirements")
         # to enable automatic deduplication of warnings
-        "requirements": __import__("copy").deepcopy(CONDITION_REQUIREMENTS),
+        "requirements": copy.deepcopy(CONDITION_REQUIREMENTS),
         # POLICY-LEVEL: Scan entire policy and enforce conditions across ALL matching statements
         # Example: "If ANY statement grants iam:CreateUser, then ALL such statements must have MFA"
         # Default: Empty list (opt-in feature)

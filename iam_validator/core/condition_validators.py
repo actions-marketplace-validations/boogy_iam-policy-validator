@@ -3,7 +3,8 @@ Condition Key and Value Validators.
 
 This module provides validators for IAM policy condition operators, keys, and values.
 Based on AWS IAM Policy Elements Reference:
-https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html
+- https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html
+- https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html
 
 Supports:
 - All standard IAM condition operators (String, Numeric, Date, Bool, Binary, IP, ARN)
@@ -14,7 +15,16 @@ Supports:
 
 import ipaddress
 import re
+from datetime import datetime
 from typing import Any
+
+# Pre-compiled regex patterns for performance (compiled once at module load)
+# Timezone offset pattern for ISO 8601 dates (e.g., 2025-01-01T12:00:00+00:00)
+_TZ_OFFSET_PATTERN = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
+    r"(?:\.(\d{1,6}))?"  # Optional milliseconds/microseconds
+    r"([+-])(\d{2}):(\d{2})$"  # Timezone offset
+)
 
 # IAM Condition Operators mapped to their expected value types
 # Reference: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html
@@ -59,6 +69,49 @@ CONDITION_OPERATORS = {
 # Set operator prefixes for multivalued condition keys
 # Reference: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_multi-value-conditions.html
 SET_OPERATOR_PREFIXES = ["ForAllValues", "ForAnyValue"]
+
+# Condition keys that are sometimes absent from the request context AND are
+# security-sensitive. Using IfExists with these keys in Allow statements can
+# bypass security controls when the key is missing.
+# Note: aws:MultiFactorAuthPresent is excluded — handled by mfa_condition_antipattern check.
+# Note: Always-present keys are in ALWAYS_PRESENT_CONDITION_KEYS.
+# Reference: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html
+SECURITY_SENSITIVE_CONDITION_KEYS = frozenset(
+    {
+        "aws:SourceIp",  # Absent when requester uses VPC endpoint
+        "aws:VpcSourceIp",  # Related to VPC context
+        "aws:SourceVpc",  # Only present with VPC endpoint
+        "aws:SourceVpce",  # Only present with VPC endpoint
+        "aws:SourceArn",  # Only for direct service principal calls
+        "aws:SourceAccount",  # Only for direct service principal calls
+        "aws:SourceOrgID",  # Only for service principal calls + org membership
+        "aws:SourceOrgPaths",  # Only for service principal calls + org membership
+        "aws:PrincipalOrgID",  # Only if principal is a member of an organization
+        "aws:PrincipalOrgPaths",  # Only if principal is a member of an organization
+        "aws:PrincipalArn",  # All signed requests only; absent for anonymous requests
+        "aws:ResourceAccount",  # Always included for most actions (has documented exceptions)
+        "aws:ResourceOrgID",  # Only if resource account is in an organization
+        "aws:ResourceOrgPaths",  # Only if resource account is in an organization
+    }
+)
+
+# Condition keys that are always present in every AWS request context.
+# Using IfExists with these keys is redundant since the key is never absent.
+# Reference: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html
+ALWAYS_PRESENT_CONDITION_KEYS = frozenset(
+    {
+        # "always included in the request context" per AWS docs
+        "aws:CurrentTime",
+        "aws:EpochTime",
+        "aws:SecureTransport",
+        "aws:ViaAWSService",
+        "aws:RequestedRegion",
+        # "included in the request context for all requests, including anonymous requests"
+        "aws:PrincipalAccount",
+        "aws:PrincipalType",
+        "aws:userid",
+    }
+)
 
 
 def normalize_operator(operator: str) -> tuple[str, str | None, str | None]:
@@ -111,6 +164,37 @@ def normalize_operator(operator: str) -> tuple[str, str | None, str | None]:
             return base_op, op_type, set_prefix
 
     return operator, None, set_prefix
+
+
+def has_if_exists_suffix(operator: str) -> bool:
+    """
+    Check if a condition operator has the IfExists suffix.
+
+    Handles set operator prefixes (ForAllValues/ForAnyValue).
+    Case-sensitive for the IfExists suffix, matching AWS IAM behavior.
+
+    Args:
+        operator: Raw operator string (e.g., "StringEqualsIfExists", "ForAllValues:StringLikeIfExists")
+
+    Returns:
+        True if the operator has the IfExists suffix
+
+    Examples:
+        >>> has_if_exists_suffix("StringEqualsIfExists")
+        True
+        >>> has_if_exists_suffix("StringEquals")
+        False
+        >>> has_if_exists_suffix("ForAllValues:StringLikeIfExists")
+        True
+        >>> has_if_exists_suffix("BoolIfExists")
+        True
+    """
+    cleaned = operator
+    if ":" in operator:
+        parts = operator.split(":", 1)
+        if parts[0] in SET_OPERATOR_PREFIXES:
+            cleaned = parts[1]
+    return cleaned.endswith("IfExists")
 
 
 def translate_type(doc_type: str) -> str:
@@ -223,6 +307,160 @@ def validate_value_for_type(value_type: str, values: list[Any]) -> tuple[bool, s
     return True, None
 
 
+def _validate_date_value(value_str: str) -> tuple[bool, str | None]:
+    """
+    Validate a date value for IAM condition operators.
+
+    AWS IAM accepts the following date formats:
+    1. ISO 8601 with UTC (Z suffix): 2019-07-16T12:00:00Z
+    2. ISO 8601 with timezone offset: 2019-07-16T12:00:00+00:00
+    3. ISO 8601 with milliseconds: 2019-07-16T12:00:00.000Z
+    4. UNIX epoch timestamp: 1563278400 (seconds since 1970-01-01)
+
+    This function validates both syntactic correctness AND semantic validity
+    (e.g., month must be 1-12, day must be valid for the month).
+
+    Args:
+        value_str: The date string to validate
+
+    Returns:
+        Tuple of (is_valid, error_message)
+
+    Reference:
+        https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html#Conditions_Date
+    """
+    # Fast path: Check for UNIX epoch timestamp (digits only)
+    # Using str.isdigit() is ~3x faster than re.match(r"^\d+$", ...)
+    if value_str.isdigit():
+        # Validate epoch timestamp is reasonable (not before 1970, not too far in future)
+        try:
+            epoch = int(value_str)
+            # Allow dates from 1970 to year 3000 (covers all reasonable use cases)
+            if epoch > 32503680000:  # Year 3000 in seconds
+                return (
+                    False,
+                    f"UNIX epoch timestamp appears unreasonably large: {value_str}. Expected seconds since 1970-01-01.",
+                )
+            return True, None
+        except (ValueError, OverflowError):
+            return (
+                False,
+                f"Invalid UNIX epoch timestamp: {value_str}. Must be a valid integer.",
+            )
+
+    # Try parsing ISO 8601 formats (ordered by most common first for performance)
+    # Using datetime.strptime with try/except is the most efficient approach
+    # as it validates both format AND semantic validity (e.g., month 13 is rejected)
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%SZ",  # Basic UTC format (most common)
+        "%Y-%m-%dT%H:%M:%S.%fZ",  # With milliseconds
+        "%Y-%m-%d",  # Date only
+    ):
+        try:
+            datetime.strptime(value_str, fmt)
+            return True, None
+        except ValueError:
+            continue
+
+    # Fall back to timezone offset parsing (e.g., +00:00, -05:00)
+    # Uses pre-compiled regex pattern for performance
+    match = _TZ_OFFSET_PATTERN.match(value_str)
+    if match:
+        year, month, day, hour, minute, second = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            int(match.group(4)),
+            int(match.group(5)),
+            int(match.group(6)),
+        )
+        tz_hour, tz_minute = int(match.group(9)), int(match.group(10))
+
+        # Validate ranges
+        validation_error = _validate_datetime_components(year, month, day, hour, minute, second, tz_hour, tz_minute)
+        if validation_error:
+            return False, validation_error
+
+        return True, None
+
+    # If nothing matched, provide a helpful error
+    return (
+        False,
+        f"Invalid Date value: `{value_str}`. Expected ISO 8601 format "
+        "(e.g., `2019-07-16T12:00:00Z`, `2019-07-16T12:00:00+00:00`) "
+        "or UNIX epoch timestamp (e.g., `1563278400`).",
+    )
+
+
+def _validate_datetime_components(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int,
+    second: int,
+    tz_hour: int = 0,
+    tz_minute: int = 0,
+) -> str | None:
+    """
+    Validate individual datetime components for semantic correctness.
+
+    Args:
+        year: Year (1-9999)
+        month: Month (1-12)
+        day: Day (1-31, depends on month)
+        hour: Hour (0-23)
+        minute: Minute (0-59)
+        second: Second (0-59)
+        tz_hour: Timezone hour offset (0-14)
+        tz_minute: Timezone minute offset (0-59)
+
+    Returns:
+        Error message string if invalid, None if valid
+    """
+    # Validate month
+    if not 1 <= month <= 12:
+        return f"Invalid month: {month}. Must be between 1 and 12."
+
+    # Validate day based on month
+    days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+    # Handle leap year for February
+    is_leap_year = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+    if is_leap_year and month == 2:
+        max_day = 29
+    else:
+        max_day = days_in_month[month]
+
+    if not 1 <= day <= max_day:
+        return f"Invalid day: {day}. For month {month}, day must be between 1 and {max_day}."
+
+    # Validate hour
+    if not 0 <= hour <= 23:
+        return f"Invalid hour: {hour}. Must be between 0 and 23."
+
+    # Validate minute
+    if not 0 <= minute <= 59:
+        return f"Invalid minute: {minute}. Must be between 0 and 59."
+
+    # Validate second (allow 59 for leap seconds)
+    if not 0 <= second <= 59:
+        return f"Invalid second: {second}. Must be between 0 and 59."
+
+    # Validate timezone offset (max +/- 14:00 per ISO 8601)
+    if not 0 <= tz_hour <= 14:
+        return f"Invalid timezone hour offset: {tz_hour}. Must be between 0 and 14."
+
+    if not 0 <= tz_minute <= 59:
+        return f"Invalid timezone minute offset: {tz_minute}. Must be between 0 and 59."
+
+    # Validate that tz offset doesn't exceed 14:00
+    if tz_hour == 14 and tz_minute > 0:
+        return "Invalid timezone offset. Maximum is +/-14:00."
+
+    return None
+
+
 def _validate_single_value(value_type: str, value_str: str) -> tuple[bool, str | None]:
     """
     Validate a single value against its expected type.
@@ -256,15 +494,15 @@ def _validate_single_value(value_type: str, value_str: str) -> tuple[bool, str |
             return False, f"Expected Bool value (true/false) but got: {value_str}"
 
     elif value_type == "Date":
-        # Date: W3C ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ) or UNIX epoch timestamp
-        iso_pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
-        epoch_pattern = r"^\d+$"
-
-        if not (re.match(iso_pattern, value_str) or re.match(epoch_pattern, value_str)):
-            return (
-                False,
-                f"Expected Date value (2019-07-16T12:00:00Z or UNIX epoch timestamp) but got: {value_str}",
-            )
+        # Date: W3C ISO 8601 format or UNIX epoch timestamp
+        # AWS accepts multiple ISO 8601 variants:
+        # - 2019-07-16T12:00:00Z (UTC with Z suffix)
+        # - 2019-07-16T12:00:00+00:00 (with timezone offset)
+        # - 2019-07-16T12:00:00.000Z (with milliseconds)
+        # - UNIX epoch timestamp (seconds since 1970-01-01)
+        is_valid_date, date_error = _validate_date_value(value_str)
+        if not is_valid_date:
+            return False, date_error
 
     elif value_type == "IPAddress":
         # IP Address: IPv4 or IPv6 with optional CIDR notation

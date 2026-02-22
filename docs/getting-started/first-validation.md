@@ -43,14 +43,8 @@ Create `user-policy.json`:
     {
       "Sid": "S3ReadAccess",
       "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::my-bucket",
-        "arn:aws:s3:::my-bucket/*"
-      ]
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]
     },
     {
       "Sid": "PassRoleToLambda",
@@ -119,14 +113,8 @@ Update `user-policy.json` to add the required condition:
     {
       "Sid": "S3ReadAccess",
       "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::my-bucket",
-        "arn:aws:s3:::my-bucket/*"
-      ]
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]
     },
     {
       "Sid": "PassRoleToLambda",
@@ -257,20 +245,20 @@ iam-validator validate --path user-policy.json --format json
 
 ## Understanding Severity Levels
 
-| Severity | Meaning | Action |
-|----------|---------|--------|
-| **Critical** | Severe security risk | Block deployment |
-| **High** | Security concern | Fix before merge |
-| **Medium** | Best practice violation | Address soon |
-| **Low** | Minor improvement | Optional fix |
-| **Error** | AWS will reject | Must fix |
-| **Warning** | Potential issue | Review |
+| Severity     | Meaning                 | Action           |
+| ------------ | ----------------------- | ---------------- |
+| **Critical** | Severe security risk    | Block deployment |
+| **High**     | Security concern        | Fix before merge |
+| **Medium**   | Best practice violation | Address soon     |
+| **Low**      | Minor improvement       | Optional fix     |
+| **Error**    | AWS will reject         | Must fix         |
+| **Warning**  | Potential issue         | Review           |
 
 ## What's Next?
 
 Now that you understand the basics:
 
 - [:octicons-arrow-right-24: Configuration Guide](../user-guide/configuration.md) — Advanced configuration options
-- [:octicons-arrow-right-24: Check Reference](../user-guide/checks/index.md) — All 19 built-in checks explained
+- [:octicons-arrow-right-24: Check Reference](../user-guide/checks/index.md) — All 21 built-in checks explained
 - [:octicons-arrow-right-24: GitHub Actions](../integrations/github-actions.md) — Automate validation in CI/CD
 - [:octicons-arrow-right-24: Custom Checks](../developer-guide/custom-checks/index.md) — Write organization-specific rules

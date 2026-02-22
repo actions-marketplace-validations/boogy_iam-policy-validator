@@ -6,6 +6,8 @@ The generated scripts provide intelligent autocompletion for:
 - Command options (--service, --access-level, etc.)
 - Cached AWS service names (for --service flag)
 
+Both `iam-validator` and `iam-policy-validator` commands are supported.
+
 Usage:
     # Bash completion
     iam-validator completion bash > ~/.bash_completion.d/iam-validator
@@ -135,20 +137,28 @@ _iam_validator_completion() {{
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
 
     # Main commands
-    local commands="validate post-to-pr analyze cache sync-services query completion"
+    local commands="validate post-to-pr analyze cache sync-services query completion mcp"
+    local global_opts="--version --log-level"
 
-    # Get the command (first non-option argument)
+    # Get the command (first non-option argument, skipping global option values)
     local cmd=""
+    local skip_next=0
     for ((i=1; i<COMP_CWORD; i++)); do
-        if [[ ${{COMP_WORDS[i]}} != -* ]]; then
-            cmd=${{COMP_WORDS[i]}}
-            break
+        if [[ $skip_next -eq 1 ]]; then
+            skip_next=0
+            continue
         fi
+        case "${{COMP_WORDS[i]}}" in
+            --log-level) skip_next=1; continue ;;
+            --version) continue ;;
+            -*) continue ;;
+            *) cmd=${{COMP_WORDS[i]}}; break ;;
+        esac
     done
 
-    # Complete main command if we're at the first argument
-    if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+    # Complete main command or global options if no command yet
+    if [[ -z "$cmd" ]]; then
+        COMPREPLY=( $(compgen -W "$commands $global_opts" -- "$cur") )
         return 0
     fi
 
@@ -162,6 +172,10 @@ _iam_validator_completion() {{
             ;;
         --access-level)
             COMPREPLY=( $(compgen -W "read write list tagging permissions-management" -- "$cur") )
+            return 0
+            ;;
+        --log-level)
+            COMPREPLY=( $(compgen -W "debug info warning error critical" -- "$cur") )
             return 0
             ;;
         --format|-f)
@@ -181,12 +195,17 @@ _iam_validator_completion() {{
             fi
             return 0
             ;;
-        --path|-p|--config|-c|--custom-checks-dir|--aws-services-dir)
+        --path|-p|--config|-c|--custom-checks-dir|--aws-services-dir|--report|-r|--check-no-new-access)
             # File/directory completion
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
-        --resource-type|--condition|--name|--batch-size)
+        --output-dir)
+            # Directory completion
+            COMPREPLY=( $(compgen -d -- "$cur") )
+            return 0
+            ;;
+        --resource-type|--condition|--has-condition-key|--name|--batch-size|--host|--port)
             # Allow any input
             return 0
             ;;
@@ -194,7 +213,17 @@ _iam_validator_completion() {{
             COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
             return 0
             ;;
+        --transport)
+            COMPREPLY=( $(compgen -W "stdio sse" -- "$cur") )
+            return 0
+            ;;
     esac
+
+    # Handle cache list --format specifically
+    if [[ "$cmd" == "cache" && "$prev" == "--format" ]]; then
+        COMPREPLY=( $(compgen -W "table columns simple" -- "$cur") )
+        return 0
+    fi
 
     # Command-specific completions
     case "$cmd" in
@@ -215,13 +244,15 @@ _iam_validator_completion() {{
             fi
 
             # Complete options for query subcommands
+            # Note: --service is optional if --name includes service prefix (e.g., s3:GetObject)
+            # Note: --name accepts multiple values and supports wildcards
             local opts=""
             case "$query_subcmd" in
                 action)
-                    opts="--service --name --access-level --resource-type --condition --output"
+                    opts="--service --name --access-level --resource-type --has-condition-key --condition --output --show-condition-keys --show-resource-types --show-access-level"
                     ;;
                 arn)
-                    opts="--service --name --list-arn-types --output"
+                    opts="--service --name --has-condition-key --list-arn-types --output --show-condition-keys --show-arn-format --show-resource-type"
                     ;;
                 condition)
                     opts="--service --name --output"
@@ -276,11 +307,25 @@ _iam_validator_completion() {{
                 COMPREPLY=( $(compgen -W "info list clear refresh prefetch location" -- "$cur") )
                 return 0
             fi
-            # Cache subcommands have no additional options
+
+            # Cache subcommand-specific options
+            case "$cache_subcmd" in
+                list)
+                    COMPREPLY=( $(compgen -W "--config --format" -- "$cur") )
+                    ;;
+                info|clear|refresh|prefetch|location)
+                    COMPREPLY=( $(compgen -W "--config" -- "$cur") )
+                    ;;
+            esac
             return 0
             ;;
         sync-services)
             opts="--output-dir --max-concurrent"
+            COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+            return 0
+            ;;
+        mcp)
+            opts="--transport --host --port --verbose -v --config"
             COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
             return 0
             ;;
@@ -290,6 +335,7 @@ _iam_validator_completion() {{
 }}
 
 complete -F _iam_validator_completion iam-validator
+complete -F _iam_validator_completion iam-policy-validator
 '''
 
     def _generate_zsh_completion(self) -> str:
@@ -302,8 +348,8 @@ complete -F _iam_validator_completion iam-validator
         # For zsh, we need to format as: 'service1' 'service2' ...
         services_list = " ".join(f"'{svc}'" for svc in cached_services) if cached_services else ""
 
-        return f"""#compdef iam-validator
-# Zsh completion for iam-validator
+        return f"""#compdef iam-validator iam-policy-validator
+# Zsh completion for iam-validator and iam-policy-validator
 # Generated by: iam-validator completion zsh
 
 _iam_validator() {{
@@ -315,6 +361,8 @@ _iam_validator() {{
     aws_services=({services_list})
 
     _arguments -C \\
+        '--version[Show version information and exit]' \\
+        '--log-level[Set logging level]:log level:(debug info warning error critical)' \\
         '1: :_iam_validator_commands' \\
         '*::arg:->args'
 
@@ -332,24 +380,32 @@ _iam_validator() {{
                             case $words[1] in
                                 action)
                                     _arguments \\
-                                        '--service[AWS service name]:service:($aws_services)' \\
-                                        '--name[Action name]:action name:' \\
+                                        '--service[AWS service (optional if --name has prefix)]:service:($aws_services)' \\
+                                        '*--name[Action name(s) - supports multiple values and wildcards]:action name:' \\
                                         '--access-level[Filter by access level]:access level:(read write list tagging permissions-management)' \\
                                         '--resource-type[Filter by resource type]:resource type:' \\
-                                        '--condition[Filter by condition key]:condition key:' \\
-                                        '--output[Output format]:format:(json yaml text)'
+                                        '--has-condition-key[Filter actions that support a specific condition key]:condition key:' \\
+                                        '--condition[Filter by condition key (alias for --has-condition-key)]:condition key:' \\
+                                        '--output[Output format]:format:(json yaml text)' \\
+                                        '--show-condition-keys[Show only condition keys for each action]' \\
+                                        '--show-resource-types[Show only resource types for each action]' \\
+                                        '--show-access-level[Show only access level for each action]'
                                     ;;
                                 arn)
                                     _arguments \\
-                                        '--service[AWS service name]:service:($aws_services)' \\
-                                        '--name[ARN resource type]:arn type:' \\
+                                        '--service[AWS service (optional if --name has prefix)]:service:($aws_services)' \\
+                                        '--name[ARN type (e.g., bucket or s3:bucket)]:arn type:' \\
+                                        '--has-condition-key[Filter ARN types that support a specific condition key]:condition key:' \\
                                         '--list-arn-types[List all ARN types]' \\
-                                        '--output[Output format]:format:(json yaml text)'
+                                        '--output[Output format]:format:(json yaml text)' \\
+                                        '--show-condition-keys[Show condition keys for each resource type]' \\
+                                        '--show-arn-format[Show ARN format patterns]' \\
+                                        '--show-resource-type[Show resource type name]'
                                     ;;
                                 condition)
                                     _arguments \\
-                                        '--service[AWS service name]:service:($aws_services)' \\
-                                        '--name[Condition key name]:condition key:' \\
+                                        '--service[AWS service (optional if --name has prefix)]:service:($aws_services)' \\
+                                        '--name[Condition key (e.g., prefix or s3:prefix)]:condition key:' \\
                                         '--output[Output format]:format:(json yaml text)'
                                     ;;
                             esac
@@ -414,8 +470,26 @@ _iam_validator() {{
                         '(--verbose -v)'{{--verbose,-v}}'[Enable verbose logging]'
                     ;;
                 cache)
-                    _arguments \\
-                        '1: :(info list clear refresh prefetch location)'
+                    local cache_state
+                    _arguments -C \\
+                        '1: :_iam_validator_cache_subcommands' \\
+                        '*::arg:->cache_args' && return 0
+
+                    case $state in
+                        cache_args)
+                            case $words[1] in
+                                info|clear|refresh|prefetch|location)
+                                    _arguments \\
+                                        '--config[Configuration file]:file:_files'
+                                    ;;
+                                list)
+                                    _arguments \\
+                                        '--config[Configuration file]:file:_files' \\
+                                        '--format[Output format]:format:(table columns simple)'
+                                    ;;
+                            esac
+                            ;;
+                    esac
                     ;;
                 sync-services)
                     _arguments \\
@@ -425,6 +499,14 @@ _iam_validator() {{
                 completion)
                     _arguments \\
                         '1: :(bash zsh)'
+                    ;;
+                mcp)
+                    _arguments \\
+                        '--transport[Transport protocol]:transport:(stdio sse)' \\
+                        '--host[Host for SSE transport]:host:' \\
+                        '--port[Port for SSE transport]:port:' \\
+                        '(--verbose -v)'{{--verbose,-v}}'[Enable verbose logging]' \\
+                        '--config[Path to configuration YAML file]:file:_files'
                     ;;
             esac
             ;;
@@ -441,6 +523,7 @@ _iam_validator_commands() {{
         'sync-services:Sync/download all AWS service definitions for offline use'
         'query:Query AWS service definitions (actions, ARNs, condition keys)'
         'completion:Generate shell completion scripts (bash or zsh)'
+        'mcp:Start MCP server for AI assistant integration'
     )
     _describe 'command' commands
 }}
@@ -453,6 +536,19 @@ _iam_validator_query_subcommands() {{
         'condition:Query condition keys'
     )
     _describe 'query subcommand' subcommands
+}}
+
+_iam_validator_cache_subcommands() {{
+    local -a subcommands
+    subcommands=(
+        'info:Show cache information and statistics'
+        'list:List all cached AWS services'
+        'clear:Clear all cached AWS service definitions'
+        'refresh:Refresh all cached services with fresh data'
+        'prefetch:Pre-fetch common AWS services (without clearing)'
+        'location:Show cache directory location'
+    )
+    _describe 'cache subcommand' subcommands
 }}
 
 _iam_validator "$@"

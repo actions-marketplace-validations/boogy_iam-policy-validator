@@ -3,11 +3,13 @@
 This module handles disk caching and offline file loading for AWS service definitions.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -138,7 +140,7 @@ class ServiceFileStorage:
         Returns:
             Path to cache file
         """
-        url_hash = hashlib.md5(url.encode()).hexdigest()
+        url_hash = hashlib.sha256(url.encode()).hexdigest()
 
         # Extract service name for better organization
         filename = f"{url_hash}.json"
@@ -150,15 +152,16 @@ class ServiceFileStorage:
 
         return self._cache_dir / filename
 
-    def read_from_cache(self, url: str, base_url: str) -> Any | None:
+    def read_from_cache(self, url: str, base_url: str, allow_stale: bool = False) -> Any | None:
         """Read from disk cache with TTL checking.
 
         Args:
             url: URL to read from cache
             base_url: Base URL for service reference API
+            allow_stale: If True, return stale cache data even if expired
 
         Returns:
-            Cached data if valid, None otherwise
+            Cached data if valid (or if allow_stale and data exists), None otherwise
         """
         if not self.enable_cache:
             return None
@@ -171,14 +174,21 @@ class ServiceFileStorage:
         try:
             # Check file modification time for TTL
             mtime = cache_path.stat().st_mtime
-            if time.time() - mtime > self.cache_ttl:
-                logger.debug(f"Cache expired for {url}")
-                cache_path.unlink()  # Remove expired cache
+            is_expired = time.time() - mtime > self.cache_ttl
+
+            if is_expired and not allow_stale:
+                # Cache expired - don't delete the file, just return None
+                # The file will be refreshed (overwritten) on next successful fetch
+                logger.debug(f"Cache expired for {url} (keeping file for refresh)")
                 return None
 
             with open(cache_path, encoding="utf-8") as f:
                 data = json.load(f)
-            logger.debug(f"Disk cache hit for {url}")
+
+            if is_expired:
+                logger.debug(f"Disk cache stale hit for {url} (allow_stale=True)")
+            else:
+                logger.debug(f"Disk cache hit for {url}")
             return data
 
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -199,8 +209,17 @@ class ServiceFileStorage:
         cache_path = self._get_cache_path(url, base_url)
 
         try:
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            # Write to temp file then atomically replace to prevent corruption on crash
+            fd, tmp_path = tempfile.mkstemp(dir=str(self._cache_dir), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp_path, cache_path)
+            except Exception:
+                # Clean up temp file on any failure
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
             logger.debug(f"Written to disk cache: {url}")
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.warning(f"Failed to write cache for {url}: {e}")

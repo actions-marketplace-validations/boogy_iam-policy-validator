@@ -25,7 +25,7 @@ description: Stop IAM misconfigurations before they become breaches
 
     [:octicons-arrow-right-24: GitHub Actions](integrations/github-actions.md)
 
--   :material-shield-check:{ .lg .middle } **18 Built-in Checks**
+-   :material-shield-check:{ .lg .middle } **21 Built-in Checks**
 
     ---
 
@@ -94,13 +94,13 @@ iam-validator validate --path ./policies/ --config iam-validator.yaml
 ## Example Output
 
 ```
-╭──────────────────────────────────────────────────────────────────────────────╮
-│                                                                              │
-│                  IAM Policy Validation Report (v1.14.6)                      │
-│                                                                              │
-╰──────────────────────────────────────────────────────────────────────────────╯
-────────────────────────────────── Detailed Results ───────────────────────────
-❌ [1/2] user-policy.json • INVALID (IAM errors + security issues)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                  IAM Policy Validation Report                                    │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+───────────────────────────────────────── Detailed Results ─────────────────────────────────────────
+❌ [1/3] examples/quick-start/user-policy.json • INVALID (IAM errors + security issues)
      2 issue(s) found
 
 Issues (2)
@@ -108,31 +108,44 @@ Issues (2)
 │   └── [Statement 2 @L10] missing_required_condition
 │       └── Required: Action(s) `iam:PassRole` require condition `iam:PassedToService`
 │           ├── Action: iam:PassRole • Condition: iam:PassedToService
-│           └── 💡 Restrict which AWS services can assume the passed role
-│
-│               Note: Found 1 statement(s) with these actions in the policy.
+│           └── 💡 Restrict which AWS services can assume the passed role to prevent privilege escalation
 │               Example:
 │               "Condition": {
 │                 "StringEquals": {
 │                   "iam:PassedToService": [
 │                     "lambda.amazonaws.com",
-│                     "ecs-tasks.amazonaws.com"
+│                     "ecs-tasks.amazonaws.com",
+│                     "ec2.amazonaws.com",
+│                     "glue.amazonaws.com"
 │                   ]
 │                 }
 │               }
 └── 🔴 Error
     └── [Statement 1 @L5] invalid_action
         └── Action `GetObjekt` not found in service `s3`.
+            └── Action: s3:GetObjekt
 
-✅ [2/2] lambda-policy.json • VALID
+❌ [2/3] examples/quick-start/s3-policy.json • FAILED (critical security issues)
+     1 issue(s) found
+
+Issues (1)
+└── 🔴 High
+    └── [Statement 1 @L5] missing_required_condition_any_of
+        └── Actions `s3:GetObject` require at least ONE of these conditions: `aws:ResourceOrgID` OR
+            `aws:ResourceOrgPaths` OR `aws:SourceIp` OR `aws:SourceVpc` OR `aws:SourceVpce` OR
+            `aws:ResourceAccount`
+            └── 💡 Add at least ONE of these conditions to restrict S3 operations
+                [truncated...]
+
+✅ [3/3] examples/quick-start/lambda-policy.json • VALID
      No issues detected
 
-╭──────────────────────────────────────────────────────────────────────────────╮
-│                                                                              │
-│  ❌ VALIDATION FAILED                                                        │
-│  1 of 2 policies have critical issues that must be resolved.                 │
-│                                                                              │
-╰──────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│  ❌ VALIDATION FAILED                                                                            │
+│  2 of 3 policies have critical issues that must be resolved.                                     │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ## GitHub Action
@@ -141,14 +154,14 @@ Issues (2)
 - uses: boogy/iam-policy-validator@v1
   with:
     path: ./policies/
-    fail-on-severity: error,critical,high
+    fail-on-warnings: true
 ```
 
 [:octicons-arrow-right-24: Full GitHub Actions Guide](integrations/github-actions.md)
 
 ## Features
 
-- **18 Built-in Checks** — AWS validation, security best practices, privilege escalation detection
+- **21 Built-in Checks** — AWS validation, security best practices, privilege escalation detection
 - **GitHub Action** — Native PR comments, review status, inline annotations
 - **Python SDK** — Programmatic validation with async support
 - **Custom Checks** — Write organization-specific validation rules

@@ -18,7 +18,9 @@ References:
 # This pattern is specifically designed for validation and allows wildcards (*) in region and account fields
 # Unlike the parsing pattern in CompiledPatterns, this is more lenient for validation purposes
 # Supports all AWS partitions: aws, aws-cn, aws-us-gov, aws-eusc, aws-iso*
-DEFAULT_ARN_VALIDATION_PATTERN = r"^arn:(aws|aws-cn|aws-us-gov|aws-eusc|aws-iso|aws-iso-b|aws-iso-e|aws-iso-f):[a-z0-9\-]+:[a-z0-9\-*]*:[0-9*]*:.+$"
+DEFAULT_ARN_VALIDATION_PATTERN = (
+    r"^arn:(aws|aws-cn|aws-us-gov|aws-eusc|aws-iso|aws-iso-b|aws-iso-e|aws-iso-f):[a-z0-9\-]+:[a-z0-9\-*]*:[0-9*]*:.+$"
+)
 
 # Maximum allowed ARN length to prevent ReDoS attacks
 # AWS maximum ARN length is approximately 2048 characters
@@ -76,6 +78,17 @@ MEDIUM_SEVERITY_LEVELS = ("warning", "medium")
 
 # Low severity issues (informational)
 LOW_SEVERITY_LEVELS = ("info", "low")
+
+# Severity configuration with emoji and action guidance for PR comments
+SEVERITY_CONFIG = {
+    "critical": {"emoji": "🔴", "action": "Block deployment"},
+    "high": {"emoji": "🟠", "action": "Fix before merge"},
+    "medium": {"emoji": "🟡", "action": "Address soon"},
+    "low": {"emoji": "🔵", "action": "Consider fixing"},
+    "error": {"emoji": "❌", "action": "Must fix - AWS will reject"},
+    "warning": {"emoji": "⚠️", "action": "Review"},
+    "info": {"emoji": "ℹ️", "action": "Optional"},
+}
 
 # ============================================================================
 # GitHub Integration
@@ -160,10 +173,6 @@ AWS_TAG_KEY_ALLOWED_CHARS = r"a-zA-Z0-9 +\-=._:/@"
 
 # Maximum length for AWS tag keys (per AWS documentation)
 AWS_TAG_KEY_MAX_LENGTH = 128
-
-# Tag-key placeholder patterns used in AWS service definitions
-# These patterns indicate where a tag key should be substituted
-AWS_TAG_KEY_PLACEHOLDERS = ("/tag-key", "/${TagKey}", "/${tag-key}")
 
 # --- Tag Value Constraints ---
 # Allowed characters in AWS tag values: letters, numbers, spaces, and + - = . _ : / @

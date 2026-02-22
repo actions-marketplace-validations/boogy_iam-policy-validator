@@ -1,16 +1,32 @@
-"""Wildcard resource check - detects Resource: '*' in IAM policies."""
+"""Wildcard resource check - detects Resource: '*' in IAM policies.
+
+This check detects statements with Resource: '*' that could grant overly broad access.
+It intelligently adjusts severity based on conditions that restrict resource scope:
+
+- Global resource-scoping conditions (aws:ResourceAccount, aws:ResourceOrgID, aws:ResourceOrgPaths)
+  always lower severity since they apply to all services.
+- Resource tag conditions (aws:ResourceTag/*) lower severity only if ALL actions in the
+  statement support the condition (validated against AWS service definitions).
+"""
 
 import asyncio
 import logging
 from typing import ClassVar
 
+from iam_validator.checks.utils import format_list_with_backticks
 from iam_validator.checks.utils.action_parser import get_action_case_insensitive, parse_action
 from iam_validator.checks.utils.wildcard_expansion import expand_wildcard_actions
 from iam_validator.core.aws_service import AWSServiceFetcher
 from iam_validator.core.check_registry import CheckConfig, PolicyCheck
+from iam_validator.core.config.aws_global_conditions import GLOBAL_RESOURCE_SCOPING_CONDITION_KEYS
 from iam_validator.core.models import ActionDetail, ServiceDetail, Statement, ValidationIssue
+from iam_validator.sdk.policy_utils import extract_condition_keys_from_statement
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of entries in module-level caches.
+# Prevents unbounded growth in long-running processes (e.g., MCP server).
+_CACHE_MAX_SIZE = 10_000
 
 # Module-level cache for action resource support lookups.
 # Maps action name (e.g., "s3:GetObject") to whether it supports resource-level permissions.
@@ -24,6 +40,13 @@ _action_resource_support_cache: dict[str, bool | None] = {}
 # "list" = list-level action (safe with wildcards)
 # Other values or None = unknown
 _action_access_level_cache: dict[str, str | None] = {}
+
+
+def _cache_put(cache: dict, key: str, value: object) -> None:
+    """Add entry to a bounded cache, clearing if max size exceeded."""
+    if len(cache) >= _CACHE_MAX_SIZE:
+        cache.clear()
+    cache[key] = value
 
 
 def _get_access_level(action_detail: ActionDetail) -> str:
@@ -70,6 +93,54 @@ def clear_resource_support_cache() -> None:
     _action_access_level_cache.clear()
 
 
+def _has_global_resource_scoping(condition_keys: set[str]) -> bool:
+    """Check if any global resource-scoping conditions are present.
+
+    Args:
+        condition_keys: Set of condition keys from the statement
+
+    Returns:
+        True if any global resource-scoping condition is present
+    """
+    return bool(condition_keys & GLOBAL_RESOURCE_SCOPING_CONDITION_KEYS)
+
+
+async def _validate_condition_key_support(
+    actions: list[str],
+    condition_key: str,
+    fetcher: AWSServiceFetcher,
+) -> tuple[bool, list[str]]:
+    """Validate if all actions support a specific condition key.
+
+    This is a generic function that works for any condition key,
+    including aws:ResourceTag/*, service-specific tags, etc.
+
+    Uses parallel execution for performance when validating multiple actions.
+
+    Args:
+        actions: List of actions to validate
+        condition_key: The condition key to check support for
+        fetcher: AWS service fetcher for looking up service definitions
+
+    Returns:
+        Tuple of (all_support, unsupported_actions) where all_support is True
+        if all actions support the condition key
+    """
+    # Validate all actions in parallel for performance using centralized fetcher method
+    results = await asyncio.gather(
+        *[fetcher.is_condition_key_supported(action, condition_key) for action in actions],
+        return_exceptions=True,
+    )
+
+    unsupported = []
+    for action, result in zip(actions, results):
+        # Treat exceptions as unsupported (conservative)
+        if isinstance(result, BaseException) or not result:
+            unsupported.append(action)
+
+    return (len(unsupported) == 0, unsupported)
+
+
 class WildcardResourceCheck(PolicyCheck):
     """Checks for wildcard resources (Resource: '*') which grant access to all resources."""
 
@@ -98,9 +169,7 @@ class WildcardResourceCheck(PolicyCheck):
         if "*" in resources:
             # First, filter out actions that don't support resource-level permissions
             # These actions legitimately require Resource: "*"
-            actions_requiring_specific_resources = await self._filter_actions_requiring_resources(
-                actions, fetcher
-            )
+            actions_requiring_specific_resources = await self._filter_actions_requiring_resources(actions, fetcher)
 
             # If all actions don't support resources, wildcard is appropriate - no issue
             if not actions_requiring_specific_resources:
@@ -123,9 +192,7 @@ class WildcardResourceCheck(PolicyCheck):
                 # Strategy 1: Check literal pattern match (fast path)
                 # If policy action matches config pattern literally, allow it
                 # Example: Policy has "iam:Get*", config has "iam:Get*" -> match
-                all_actions_allowed_literal = all(
-                    action in allowed_wildcards_config for action in non_wildcard_actions
-                )
+                all_actions_allowed_literal = all(action in allowed_wildcards_config for action in non_wildcard_actions)
 
                 if all_actions_allowed_literal:
                     # All actions match literally, Resource: "*" is acceptable
@@ -136,14 +203,11 @@ class WildcardResourceCheck(PolicyCheck):
                 # Example: Policy has "iam:Get*" -> ["iam:GetUser", ...],
                 #          config has "iam:Get*" -> ["iam:GetUser", ...] -> all match
                 if allowed_wildcards_expanded:
-                    expanded_statement_actions = await expand_wildcard_actions(
-                        non_wildcard_actions, fetcher
-                    )
+                    expanded_statement_actions = await expand_wildcard_actions(non_wildcard_actions, fetcher)
 
                     # Check if all expanded actions are in the expanded allowed list (exact match)
                     all_actions_allowed_expanded = all(
-                        action in allowed_wildcards_expanded
-                        for action in expanded_statement_actions
+                        action in allowed_wildcards_expanded for action in expanded_statement_actions
                     )
 
                     # If all actions are in the expanded list, skip the wildcard resource warning
@@ -152,6 +216,15 @@ class WildcardResourceCheck(PolicyCheck):
                         return issues
 
             # Flag the issue if actions are not all allowed or no allowed_wildcards configured
+            # First, determine if severity should be adjusted based on conditions
+            base_severity = self.get_severity(config)
+            adjusted_severity, adjustment_reason = await self._determine_severity_adjustment(
+                statement,
+                actions_requiring_specific_resources,
+                fetcher,
+                base_severity,
+            )
+
             # Build a helpful message showing which actions require specific resources
             custom_message = config.config.get("message")
             if custom_message:
@@ -161,24 +234,21 @@ class WildcardResourceCheck(PolicyCheck):
                 # Note: actions_requiring_specific_resources is guaranteed non-empty here
                 # because we return early above if it's empty
                 sorted_actions = sorted(actions_requiring_specific_resources)
-                if len(sorted_actions) <= 5:
-                    action_list = ", ".join(f"`{a}`" for a in sorted_actions)
-                else:
-                    action_list = ", ".join(f"`{a}`" for a in sorted_actions[:5])
+                action_list = format_list_with_backticks(sorted_actions, max_items=5)
+                if len(sorted_actions) > 5:
                     action_list += f" (+{len(sorted_actions) - 5} more)"
-                message = (
-                    f'Statement applies to all resources `"*"`. '
-                    f"Actions that support resource-level permissions: {action_list}"
-                )
+                message = f'Statement applies to all resources (`"*"`) with actions that typically require specific resources: {action_list}'
 
-            suggestion = config.config.get(
-                "suggestion", "Replace wildcard with specific resource ARNs"
-            )
+                # Add adjustment reason if present
+                if adjustment_reason:
+                    message += f". {adjustment_reason}"
+
+            suggestion = config.config.get("suggestion", "Replace wildcard with specific resource ARNs")
             example = config.config.get("example", "")
 
             issues.append(
                 ValidationIssue(
-                    severity=self.get_severity(config),
+                    severity=adjusted_severity,
                     statement_sid=statement.sid,
                     statement_index=statement_idx,
                     issue_type="overly_permissive",
@@ -192,9 +262,7 @@ class WildcardResourceCheck(PolicyCheck):
 
         return issues
 
-    async def _get_expanded_allowed_wildcards(
-        self, config: CheckConfig, fetcher: AWSServiceFetcher
-    ) -> frozenset[str]:
+    async def _get_expanded_allowed_wildcards(self, config: CheckConfig, fetcher: AWSServiceFetcher) -> frozenset[str]:
         """Get and expand allowed_wildcards configuration.
 
         This method retrieves wildcard patterns from the allowed_wildcards config
@@ -237,9 +305,66 @@ class WildcardResourceCheck(PolicyCheck):
 
         return frozenset(expanded_actions)
 
-    async def _filter_actions_requiring_resources(
-        self, actions: list[str], fetcher: AWSServiceFetcher
-    ) -> list[str]:
+    async def _determine_severity_adjustment(
+        self,
+        statement: Statement,
+        actions: list[str],
+        fetcher: AWSServiceFetcher,
+        base_severity: str,
+    ) -> tuple[str, str | None]:
+        """Determine if severity should be adjusted based on resource-scoping conditions.
+
+        This method checks if the statement has conditions that meaningfully restrict
+        resource scope:
+        1. Global resource-scoping conditions (aws:ResourceAccount, etc.) always lower severity
+        2. Resource tag conditions (aws:ResourceTag/*) lower severity only if ALL actions support them
+
+        Args:
+            statement: The policy statement being checked
+            actions: List of actions that require specific resources
+            fetcher: AWS service fetcher for validating condition key support
+            base_severity: The default severity level
+
+        Returns:
+            Tuple of (adjusted_severity, reason) where reason explains the adjustment
+        """
+        condition_keys = extract_condition_keys_from_statement(statement)
+        if not condition_keys:
+            return (base_severity, None)
+
+        # Check for global resource-scoping conditions (always valid for all services)
+        if _has_global_resource_scoping(condition_keys):
+            global_keys = condition_keys & GLOBAL_RESOURCE_SCOPING_CONDITION_KEYS
+            return (
+                "low",
+                f"Severity lowered: resource scope restricted by `{', '.join(sorted(global_keys))}`",
+            )
+
+        # Check for aws:ResourceTag conditions (must validate per-action support)
+        resource_tag_keys = {k for k in condition_keys if k.startswith("aws:ResourceTag/")}
+        if resource_tag_keys:
+            # Use the first tag key for validation (all should have same support pattern)
+            tag_key = next(iter(resource_tag_keys))
+            all_support, unsupported = await _validate_condition_key_support(actions, tag_key, fetcher)
+            if all_support:
+                return (
+                    "low",
+                    f"Severity lowered: resource scope restricted by `{', '.join(sorted(resource_tag_keys))}`",
+                )
+            else:
+                # Tag condition present but not all actions support it
+                unsupported_display = unsupported[:3]
+                more = f" (+{len(unsupported) - 3} more)" if len(unsupported) > 3 else ""
+                return (
+                    base_severity,
+                    f"Note: `aws:ResourceTag` condition found but these actions don't support "
+                    f"resource tags: `{', '.join(unsupported_display)}`{more}",
+                )
+
+        # Has conditions but none that scope resources
+        return (base_severity, None)
+
+    async def _filter_actions_requiring_resources(self, actions: list[str], fetcher: AWSServiceFetcher) -> list[str]:
         """Filter actions to only those that should be flagged for wildcard resources.
 
         This method filters out actions that legitimately use Resource: "*":
@@ -337,8 +462,8 @@ class WildcardResourceCheck(PolicyCheck):
             if not service_detail:
                 # Unknown service - keep all its actions (be conservative)
                 for action, _ in action_list:
-                    _action_resource_support_cache[action] = None  # Cache as unknown
-                    _action_access_level_cache[action] = None  # Cache as unknown
+                    _cache_put(_action_resource_support_cache, action, None)  # Cache as unknown
+                    _cache_put(_action_access_level_cache, action, None)  # Cache as unknown
                     actions_requiring_resources.append(action)
                 continue
 
@@ -347,24 +472,24 @@ class WildcardResourceCheck(PolicyCheck):
                 action_detail = get_action_case_insensitive(service_detail.actions, action_name)
                 if not action_detail:
                     # Unknown action - keep it (be conservative)
-                    _action_resource_support_cache[action] = None  # Cache as unknown
-                    _action_access_level_cache[action] = None  # Cache as unknown
+                    _cache_put(_action_resource_support_cache, action, None)  # Cache as unknown
+                    _cache_put(_action_access_level_cache, action, None)  # Cache as unknown
                     actions_requiring_resources.append(action)
                     continue
 
                 # Get action's access level and cache it
                 access_level = _get_access_level(action_detail)
-                _action_access_level_cache[action] = access_level
+                _cache_put(_action_access_level_cache, action, access_level)
 
                 # Skip list-level actions - they only enumerate resources and are safe with wildcards
                 if access_level == "list":
-                    _action_resource_support_cache[action] = False  # Mark as not needing resources
+                    _cache_put(_action_resource_support_cache, action, False)  # Mark as not needing resources
                     continue
 
                 # Check if action supports resource-level permissions
                 # action_detail.resources is empty for actions that don't support resources
                 supports_resources = bool(action_detail.resources)
-                _action_resource_support_cache[action] = supports_resources  # Cache result
+                _cache_put(_action_resource_support_cache, action, supports_resources)  # Cache result
 
                 if supports_resources:
                     # Action supports resources - should be flagged for wildcard
