@@ -52,12 +52,13 @@ jobs:
         id: pr_info
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          PR_DATA=$(gh pr view ${{ inputs.pr_number }} --repo ${{ github.repository }} --json headRefName,title,state)
+          PR_DATA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName,title,state)
 
           STATE=$(echo "$PR_DATA" | jq -r '.state')
           if [ "$STATE" != "OPEN" ]; then
-            echo "❌ PR #${{ inputs.pr_number }} is not open (state: $STATE)"
+            echo "❌ PR #$PR_NUMBER is not open (state: $STATE)"
             exit 1
           fi
 
@@ -66,21 +67,21 @@ jobs:
 
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "title=$TITLE" >> $GITHUB_OUTPUT
-          echo "✅ PR #${{ inputs.pr_number }}: $TITLE (branch: $BRANCH)"
+          echo "✅ PR #$PR_NUMBER: $TITLE (branch: $BRANCH)"
 
       - name: Checkout PR branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.pr_info.outputs.branch }}
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ inputs.python_version }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7.3.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
 
@@ -143,6 +144,11 @@ jobs:
 
       - name: Generate pre-release notes
         id: release_notes
+        env:
+          # PR title/branch are attacker-influenced; pass via env so the unquoted
+          # heredoc cannot command-substitute their content.
+          PR_TITLE: ${{ steps.pr_info.outputs.title }}
+          PR_BRANCH: ${{ steps.pr_info.outputs.branch }}
         run: |
           cat > PRERELEASE_NOTES.md << EOF
           # Pre-Release: ${{ steps.version.outputs.tag }}
@@ -154,8 +160,8 @@ jobs:
           **⚠️ Not recommended for production use.**
 
           ### PR Information
-          - **PR**: #${{ inputs.pr_number }} - ${{ steps.pr_info.outputs.title }}
-          - **Branch**: \`${{ steps.pr_info.outputs.branch }}\`
+          - **PR**: #${{ inputs.pr_number }} - ${PR_TITLE}
+          - **Branch**: \`${PR_BRANCH}\`
           - **Base Version**: \`${{ steps.version.outputs.base_version }}\`
           - **Pre-release**: \`${{ inputs.release_type }}.${{ inputs.pre_release_number }}\`
 
@@ -178,7 +184,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Pre-Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           name: "${{ steps.version.outputs.tag }}"
           tag_name: ${{ steps.version.outputs.tag }}
@@ -197,8 +203,9 @@ jobs:
       - name: Comment on PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          gh pr comment ${{ inputs.pr_number }} --repo ${{ github.repository }} --body \
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
           "## 🚀 Pre-Release Created
 
           A **${{ inputs.release_type }}** pre-release has been created from this PR.
@@ -216,6 +223,9 @@ jobs:
 
       - name: Create Summary
         if: always()
+        env:
+          PR_TITLE: ${{ steps.pr_info.outputs.title }}
+          PR_BRANCH: ${{ steps.pr_info.outputs.branch }}
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
           # 🧪 Pre-Release Summary
@@ -224,8 +234,8 @@ jobs:
           - **Type**: ${{ inputs.release_type }}
           - **Version**: \`${{ steps.version.outputs.version }}\`
           - **Tag**: \`${{ steps.version.outputs.tag }}\`
-          - **PR**: [#${{ inputs.pr_number }}](https://github.com/${{ github.repository }}/pull/${{ inputs.pr_number }}) - ${{ steps.pr_info.outputs.title }}
-          - **Branch**: \`${{ steps.pr_info.outputs.branch }}\`
+          - **PR**: [#${{ inputs.pr_number }}](https://github.com/${{ github.repository }}/pull/${{ inputs.pr_number }}) - ${PR_TITLE}
+          - **Branch**: \`${PR_BRANCH}\`
 
           ## 🔗 Links
           - [📦 GitHub Release](https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.tag }})

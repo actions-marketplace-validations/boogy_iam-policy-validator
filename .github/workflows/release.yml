@@ -9,6 +9,7 @@ permissions: read-all
 
 env:
   PYTHON_VERSION: "3.13"
+  PYPI_PROJECT: "iam-policy-validator"
 
 jobs:
   build-and-release:
@@ -16,24 +17,86 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     permissions:
-      contents: write  # Required for creating GitHub releases
-      id-token: write  # Required for PyPI trusted publishing
+      contents: write # Required for creating releases and pushing rolling tags
+      id-token: write # Required for PyPI trusted publishing
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # Full history for changelog generation
+          fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7.3.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          TAG=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" =~ (rc|beta|alpha) ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Guard rail #1: If a PUBLISHED (immutable) release already exists for
+      # this tag, abort immediately. PyPI versions cannot be re-published
+      # either, so proceeding would leave the project in an inconsistent
+      # state. Drafts are OK — a failed prior run can be retried.
+      - name: Check for existing published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.get_version.outputs.tag }}"
+          STATE=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo "not-found")
+          case "$STATE" in
+            not-found)
+              echo "OK: no release exists for $TAG yet"
+              ;;
+            true)
+              echo "OK: draft release exists for $TAG — will retry/update it"
+              ;;
+            false)
+              echo "::error::A published (immutable) release for $TAG already exists."
+              echo "::error::PyPI and GitHub both refuse duplicate versions. Bump the version and tag again."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected release state: $STATE"
+              exit 1
+              ;;
+          esac
+
+      # Guard rail #2: If PyPI already has this version for a non-prerelease
+      # and no draft release exists on GH, this is a re-tag of a fully
+      # released version. PyPI versions are permanent — fail rather than
+      # silently skip.
+      - name: Check for existing PyPI version
+        if: steps.get_version.outputs.is_prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="${{ steps.get_version.outputs.tag }}"
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://pypi.org/pypi/${PYPI_PROJECT}/${VERSION}/json")
+          DRAFT=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo "not-found")
+          if [ "$HTTP" = "200" ] && [ "$DRAFT" != "true" ]; then
+            echo "::error::${PYPI_PROJECT}==${VERSION} is already on PyPI and no draft release exists."
+            echo "::error::This tag looks like a re-tag of a fully released version. Bump the version and tag again."
+            exit 1
+          fi
+          echo "OK to proceed (PyPI HTTP=$HTTP, GH draft=$DRAFT)"
 
       - name: Install dependencies
         run: uv sync --frozen
@@ -41,71 +104,107 @@ jobs:
       - name: Build package
         run: uv build
 
-      - name: Get version from tag
-        id: get_version
+      # Guard rail #3: verify build produced both wheel and sdist before
+      # we create any release artifacts.
+      - name: Verify build output
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Generate changelog
-        id: changelog
-        run: |
-          # Get the previous tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-
-          if [ -z "$PREV_TAG" ]; then
-            # First release - get all commits
-            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
-          else
-            # Get commits since previous tag
-            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          ls -la dist/
+          WHEEL=$(ls dist/*.whl 2>/dev/null | wc -l)
+          SDIST=$(ls dist/*.tar.gz 2>/dev/null | wc -l)
+          if [ "$WHEEL" -lt 1 ] || [ "$SDIST" -lt 1 ]; then
+            echo "::error::build did not produce expected artifacts (wheel=$WHEEL sdist=$SDIST)"
+            exit 1
           fi
+          echo "Build OK: wheel=$WHEEL sdist=$SDIST"
 
-          # Save to file for multiline output
-          echo "$CHANGELOG" > CHANGELOG.txt
-
-          # Also create a summary
-          COMMIT_COUNT=$(echo "$CHANGELOG" | wc -l)
-          echo "Generated changelog with $COMMIT_COUNT commits"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+      # Step 1: Create the GitHub release as a DRAFT with all assets attached.
+      # Under immutable releases, a release cannot be modified after it is
+      # published — creating as draft lets us verify every asset uploaded
+      # correctly before the release becomes immutable. If a draft already
+      # exists (previous run failed), softprops updates it in place.
+      #
+      # generate_release_notes builds GitHub's auto changelog (merged PRs since
+      # the previous tag, grouped into the categories from .github/release.yml,
+      # plus New Contributors and a Full Changelog compare link).
+      - name: Create draft release with assets
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           name: ${{ steps.get_version.outputs.tag }}
-          body_path: CHANGELOG.txt
           files: |
             dist/*.whl
             dist/*.tar.gz
-          draft: false
-          prerelease: ${{ contains(steps.get_version.outputs.version, 'rc') || contains(steps.get_version.outputs.version, 'beta') || contains(steps.get_version.outputs.version, 'alpha') }}
+          draft: true
+          prerelease: ${{ steps.get_version.outputs.is_prerelease }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Step 2: Verify the draft has both the wheel and the sdist attached.
+      # If either failed to upload, abort — the job can be re-run safely
+      # because the draft is still editable.
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.get_version.outputs.tag }}"
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          echo "Attached assets:"
+          echo "$ASSETS"
+          WHEEL_COUNT=$(echo "$ASSETS" | grep -c '\.whl$' || true)
+          SDIST_COUNT=$(echo "$ASSETS" | grep -c '\.tar\.gz$' || true)
+          if [ "$WHEEL_COUNT" -lt 1 ] || [ "$SDIST_COUNT" -lt 1 ]; then
+            echo "::error::expected >=1 wheel and >=1 sdist, got wheel=$WHEEL_COUNT sdist=$SDIST_COUNT"
+            exit 1
+          fi
+          echo "OK: $WHEEL_COUNT wheel(s) and $SDIST_COUNT sdist(s) attached"
+
+      # Step 3: Publish to PyPI BEFORE promoting the GitHub release.
+      # If PyPI fails here, the GitHub release is still a draft and the
+      # job can be re-run. `--check-url` makes the upload idempotent: if
+      # a previous run already uploaded some files, they are skipped
+      # rather than erroring with "file already exists". Trusted
+      # publishing is OIDC-based; no API token needed.
       - name: Publish to PyPI
-        if: |
-          !contains(steps.get_version.outputs.version, 'rc') &&
-          !contains(steps.get_version.outputs.version, 'beta') &&
-          !contains(steps.get_version.outputs.version, 'alpha')
-        run: uv publish --trusted-publishing always
+        if: steps.get_version.outputs.is_prerelease == 'false'
+        run: |
+          uv publish \
+            --trusted-publishing always \
+            --check-url https://pypi.org/simple/
+
+      # Step 4: Promote the draft to a published release. The release
+      # becomes immutable at this point — assets and the v<version> tag
+      # can no longer be modified. Idempotent: if the release is already
+      # published (e.g. a previous run raced past this step), skip.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.get_version.outputs.tag }}"
+          IS_DRAFT=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "Release $TAG is already published (immutable). Nothing to promote."
+            exit 0
+          fi
+          if [ "${{ steps.get_version.outputs.is_prerelease }}" = "true" ]; then
+            gh release edit "$TAG" --draft=false
+          else
+            gh release edit "$TAG" --draft=false --latest
+          fi
 
       - name: Create Release Summary
         if: always()
         run: |
           VERSION="${{ steps.get_version.outputs.version }}"
           TAG="${{ steps.get_version.outputs.tag }}"
-          IS_PRERELEASE="${{ contains(steps.get_version.outputs.version, 'rc') || contains(steps.get_version.outputs.version, 'beta') || contains(steps.get_version.outputs.version, 'alpha') }}"
-
-          # Extract major and minor versions
+          IS_PRERELEASE="${{ steps.get_version.outputs.is_prerelease }}"
           MAJOR=$(echo "$VERSION" | cut -d. -f1)
           MINOR=$(echo "$VERSION" | cut -d. -f1-2)
 
-          cat >> $GITHUB_STEP_SUMMARY << EOF
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
           # 🚀 Release Summary
 
           ## 📦 Package Information
-          - **Package**: \`iam-policy-validator\`
+          - **Package**: \`${PYPI_PROJECT}\`
           - **Version**: \`$VERSION\`
           - **Tag**: \`$TAG\`
 
@@ -113,60 +212,33 @@ jobs:
 
           ### GitHub Release
           - ✅ Created release: [$TAG](https://github.com/${{ github.repository }}/releases/tag/$TAG)
-          - 📄 Changelog generated from commits
           - 📦 Artifacts attached: wheel + source distribution
+          - 🔒 Immutable: once published, assets and the v$VERSION tag cannot be modified
 
           ### PyPI
-          $(if [ "$IS_PRERELEASE" = "false" ]; then echo "- ✅ Published to [PyPI](https://pypi.org/project/iam-policy-validator/)"; else echo "- ⏭️ Skipped (pre-release version)"; fi)
+          $(if [ "$IS_PRERELEASE" = "false" ]; then echo "- ✅ Published to [PyPI](https://pypi.org/project/${PYPI_PROJECT}/)"; else echo "- ⏭️ Skipped (pre-release version)"; fi)
 
-          ### Version Tags
-          - 🏷️ Major tag: \`v$MAJOR\`
-          - 🏷️ Minor tag: \`v$MINOR\`
-          - 🏷️ Full tag: \`v$VERSION\`
+          ### Rolling Tags
+          - ⚠️ Run manually after this release — intentionally not automated so the
+            rolling tags stay signed with the maintainer's key rather than a CI key:
+          \`\`\`bash
+          git fetch --tags
+          git tag -f -s v$MAJOR -m "Rolling tag: v$MAJOR → v$VERSION" $TAG^{}
+          git tag -f -s v$MINOR -m "Rolling tag: v$MINOR → v$VERSION" $TAG^{}
+          git push --force origin v$MAJOR v$MINOR
+          \`\`\`
+          - ℹ️ \`-s -m\` are required (\`tag.gpgsign=true\` makes a message mandatory), and
+            the target is \`$TAG^{}\` — the commit, not the tag — so these stay annotated
+            rolling tags instead of becoming nested lightweight ones.
+          - 🏷️ Immutable tag: \`v$VERSION\`
 
           ## 🔗 Quick Links
-          - [📦 PyPI Package](https://pypi.org/project/iam-policy-validator/)
+          - [📦 PyPI Package](https://pypi.org/project/${PYPI_PROJECT}/)
           - [📚 GitHub Release](https://github.com/${{ github.repository }}/releases/tag/$TAG)
           - [📖 Repository](https://github.com/${{ github.repository }})
 
           ## 📥 Installation
           \`\`\`bash
-          pip install iam-policy-validator==$VERSION
-          \`\`\`
-
-          or use the latest:
-          \`\`\`bash
-          pip install iam-policy-validator
+          pip install ${PYPI_PROJECT}==$VERSION
           \`\`\`
           EOF
-
-  # update-action-versions:
-  #   name: Update Major/Minor Tag References
-  #   runs-on: ubuntu-latest
-  #   needs: build-and-release
-
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5
-
-  #     - name: Configure Git
-  #       run: |
-  #         git config user.name "github-actions[bot]"
-  #         git config user.email "github-actions[bot]@users.noreply.github.com"
-
-  #     - name: Update major and minor version tags
-  #       run: |
-  #         VERSION=${GITHUB_REF#refs/tags/v}
-  #         MAJOR=$(echo $VERSION | cut -d. -f1)
-  #         MINOR=$(echo $VERSION | cut -d. -f1-2)
-
-  #         # Update vX tag (e.g., v1) - annotated (unsigned by bot)
-  #         git tag -fa "v$MAJOR" -m "Update v$MAJOR to $VERSION"
-  #         git push origin "v$MAJOR" --force
-
-  #         # Update vX.Y tag (e.g., v1.2) - annotated (unsigned by bot)
-  #         git tag -fa "v$MINOR" -m "Updated v$MINOR to $VERSION"
-  #         git push origin "v$MINOR" --force
-
-  #         echo "✅ Updated tags: v$MAJOR and v$MINOR to point to $VERSION"
-  #         echo "ℹ️  Note: Automated tags are annotated but not signed by the bot."

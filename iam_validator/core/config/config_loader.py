@@ -5,20 +5,30 @@ Loads and parses configuration from YAML files, environment variables,
 and command-line arguments.
 """
 
+import fnmatch
 import importlib
 import importlib.util
 import inspect
 import logging
 import sys
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from iam_validator.core.check_registry import CheckConfig, CheckRegistry, PolicyCheck
 from iam_validator.core.config.defaults import get_default_config
-from iam_validator.core.constants import DEFAULT_CONFIG_FILENAMES
+from iam_validator.core.constants import (
+    _COMMENT_TAG_RE,
+    COMMENT_TAG_PATTERN,
+    DEFAULT_CONFIG_FILENAMES,
+)
+from iam_validator.core.models import PolicyType
+
+# Valid PolicyType literal values (derived from the Literal in models.py so we
+# don't drift when a new type is added).
+VALID_POLICY_TYPES = frozenset(get_args(PolicyType))
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +62,24 @@ KNOWN_CHECK_IDS = frozenset(
         "wildcard_resource",
     ]
 )
+
+
+def _match_glob(posix_path: str, filename: str, pattern: str) -> bool:
+    """Match a POSIX path / filename against a glob pattern.
+
+    Tries the full path first, then the filename, then — if the pattern starts
+    with ``**/`` — repeats with the leading recursive prefix stripped so the
+    pattern also covers files at the search root. ``fnmatch`` already treats
+    ``*`` greedily (matches ``/``), so this is enough to cover the patterns
+    documented in the user guide.
+    """
+    if fnmatch.fnmatch(posix_path, pattern) or fnmatch.fnmatch(filename, pattern):
+        return True
+    if pattern.startswith("**/"):
+        stripped = pattern[3:]
+        if fnmatch.fnmatch(posix_path, stripped) or fnmatch.fnmatch(filename, stripped):
+            return True
+    return False
 
 
 # =============================================================================
@@ -138,6 +166,29 @@ class SettingsSchema(BaseModel):
     ignore_settings: IgnoreSettingsSchema = IgnoreSettingsSchema()
     documentation: DocumentationSettingsSchema = DocumentationSettingsSchema()
     hide_severities: list[str] | None = None  # Global severity filtering
+    off_diff_comment_mode: str = "summary_only"
+    comment_tag: str | None = None
+
+    @field_validator("off_diff_comment_mode")
+    @classmethod
+    def validate_off_diff_comment_mode(cls, v: str) -> str:
+        valid_modes = {"summary_only", "individual", "modified_statements_only"}
+        if v not in valid_modes:
+            raise ValueError(f"Invalid off_diff_comment_mode: {v}. Must be one of: {sorted(valid_modes)}")
+        return v
+
+    @field_validator("comment_tag")
+    @classmethod
+    def validate_comment_tag(cls, v: str | None) -> str | None:
+        # ``None`` and empty string disable scoping (legacy markers).
+        if not v:
+            return None
+        if not _COMMENT_TAG_RE.fullmatch(v):
+            raise ValueError(
+                f"Invalid comment_tag: {v!r}. Must match {COMMENT_TAG_PATTERN} "
+                "(letters, digits, '.', '_', '-', 1-32 chars)."
+            )
+        return v
 
     @field_validator("fail_on_severity")
     @classmethod
@@ -158,6 +209,26 @@ class SettingsSchema(BaseModel):
                     raise ValueError(
                         f"Invalid severity in hide_severities: {severity}. Must be one of: {sorted(SEVERITY_LEVELS)}"
                     )
+        return v
+
+
+class PolicyTypeGlobSchema(BaseModel):
+    """Glob pattern → PolicyType mapping entry.
+
+    Used by the orchestrator when ``--policy-type`` is not supplied to resolve
+    a per-file policy type before auto-detection runs. First match wins.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str
+    type: str
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, v: str) -> str:
+        if v not in VALID_POLICY_TYPES:
+            raise ValueError(f"Invalid policy type: {v}. Must be one of: {sorted(VALID_POLICY_TYPES)}")
         return v
 
 
@@ -191,6 +262,7 @@ class ConfigSchema(BaseModel):
     settings: SettingsSchema = SettingsSchema()
     custom_checks: list[CustomCheckSchema] = []
     custom_checks_dir: str | None = None
+    policy_types: list[PolicyTypeGlobSchema] = []
 
     @model_validator(mode="after")
     def warn_unknown_checks(self) -> "ConfigSchema":
@@ -333,6 +405,15 @@ class ValidatorConfig:
         self.custom_checks = self.config_dict.get("custom_checks", [])
         self.custom_checks_dir = self.config_dict.get("custom_checks_dir")
         self.settings = self.config_dict.get("settings", {})
+        # Per-file policy-type glob mappings (first match wins). Each entry is
+        # a dict with ``pattern`` and ``type`` keys — validated via
+        # PolicyTypeGlobSchema at load time.
+        raw_policy_types = self.config_dict.get("policy_types", []) or []
+        self.policy_types: list[dict[str, str]] = [
+            {"pattern": entry["pattern"], "type": entry["type"]}
+            for entry in raw_policy_types
+            if isinstance(entry, dict) and "pattern" in entry and "type" in entry
+        ]
 
     def get_check_config(self, check_id: str) -> dict[str, Any]:
         """Get configuration for a specific check."""
@@ -351,6 +432,37 @@ class ValidatorConfig:
     def get_setting(self, key: str, default: Any = None) -> Any:
         """Get a global setting value."""
         return self.settings.get(key, default)
+
+    def get_policy_type_for_path(self, path: str | Path) -> PolicyType | None:
+        """Resolve a PolicyType from the ``policy_types:`` glob list for a file path.
+
+        First-match-wins. Paths and patterns are compared in POSIX form so
+        ``**/scp/*.json`` behaves identically on macOS, Linux, and Windows.
+        Each pattern is tried against (a) the full POSIX path and (b) the
+        bare filename. A leading ``**/`` is also stripped so patterns like
+        ``**/scp/*.json`` still match files that live at the top of the
+        scanned tree (e.g. ``scp/org.json``).
+
+        Args:
+            path: File path to resolve (absolute or relative).
+
+        Returns:
+            The configured ``PolicyType`` if a pattern matches, otherwise
+            ``None``. Returning ``None`` means the caller should fall through
+            to content auto-detection.
+        """
+        if not self.policy_types:
+            return None
+
+        posix_path = Path(path).as_posix()
+        filename = PurePosixPath(posix_path).name
+
+        for entry in self.policy_types:
+            pattern = entry["pattern"]
+            if _match_glob(posix_path, filename, pattern):
+                return entry["type"]  # type: ignore[return-value]
+
+        return None
 
 
 class ConfigLoader:

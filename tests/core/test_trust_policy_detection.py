@@ -20,11 +20,8 @@ class TestTrustPolicyDetection:
             ],
         )
 
-        # is_trust_policy() still detects it (used for hints/validation logic)
         assert is_trust_policy(policy) is True
-        # detect_policy_type() returns RESOURCE_POLICY (no auto-detection to TRUST_POLICY)
-        # User must explicitly use --policy-type TRUST_POLICY
-        assert detect_policy_type(policy) == "RESOURCE_POLICY"
+        assert detect_policy_type(policy) == "TRUST_POLICY"
 
     def test_github_actions_oidc_trust_policy(self):
         """Test detection of GitHub Actions OIDC trust policy."""
@@ -40,7 +37,7 @@ class TestTrustPolicyDetection:
         )
 
         assert is_trust_policy(policy) is True
-        assert detect_policy_type(policy) == "RESOURCE_POLICY"  # No auto-detect to TRUST_POLICY
+        assert detect_policy_type(policy) == "TRUST_POLICY"
 
     def test_saml_trust_policy(self):
         """Test detection of SAML trust policy."""
@@ -57,7 +54,7 @@ class TestTrustPolicyDetection:
         )
 
         assert is_trust_policy(policy) is True
-        assert detect_policy_type(policy) == "RESOURCE_POLICY"  # No auto-detect to TRUST_POLICY
+        assert detect_policy_type(policy) == "TRUST_POLICY"
 
     def test_cross_account_trust_policy(self):
         """Test detection of cross-account trust policy."""
@@ -74,7 +71,7 @@ class TestTrustPolicyDetection:
         )
 
         assert is_trust_policy(policy) is True
-        assert detect_policy_type(policy) == "RESOURCE_POLICY"  # No auto-detect to TRUST_POLICY
+        assert detect_policy_type(policy) == "TRUST_POLICY"
 
     def test_trust_policy_with_tag_session(self):
         """Test detection with sts:TagSession action."""
@@ -90,7 +87,7 @@ class TestTrustPolicyDetection:
         )
 
         assert is_trust_policy(policy) is True
-        assert detect_policy_type(policy) == "RESOURCE_POLICY"  # No auto-detect to TRUST_POLICY
+        assert detect_policy_type(policy) == "TRUST_POLICY"
 
     # ========================================================================
     # Negative Tests - NOT Trust Policies
@@ -175,7 +172,7 @@ class TestTrustPolicyDetection:
         )
 
         assert is_trust_policy(policy) is True
-        assert detect_policy_type(policy) == "RESOURCE_POLICY"  # No auto-detect to TRUST_POLICY
+        assert detect_policy_type(policy) == "TRUST_POLICY"
 
     def test_trust_policy_with_service_wildcard_resource(self):
         """Test that trust policy with Resource: service:* is still detected."""
@@ -232,7 +229,7 @@ class TestTrustPolicyDetection:
         )
 
         assert is_trust_policy(policy) is True
-        assert detect_policy_type(policy) == "RESOURCE_POLICY"  # No auto-detect to TRUST_POLICY
+        assert detect_policy_type(policy) == "TRUST_POLICY"
 
     def test_no_principal_not_trust_policy(self):
         """Test that policy without Principal is NOT trust policy."""
@@ -249,3 +246,137 @@ class TestTrustPolicyDetection:
 
         assert is_trust_policy(policy) is False
         assert detect_policy_type(policy) == "IDENTITY_POLICY"
+
+    def test_multiple_assume_statements_all_valid(self):
+        """Multi-statement trust policy with several assume actions is detected."""
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[
+                Statement(
+                    Sid="AllowLambda",
+                    Effect="Allow",
+                    Principal={"Service": "lambda.amazonaws.com"},
+                    Action="sts:AssumeRole",
+                ),
+                Statement(
+                    Sid="AllowEC2",
+                    Effect="Allow",
+                    Principal={"Service": "ec2.amazonaws.com"},
+                    Action="sts:AssumeRole",
+                ),
+                Statement(
+                    Sid="AllowTagging",
+                    Effect="Allow",
+                    Principal={"AWS": "arn:aws:iam::123:root"},
+                    Action="sts:TagSession",
+                ),
+            ],
+        )
+        assert is_trust_policy(policy) is True
+
+    def test_mixed_assume_and_tag_session(self):
+        """Combination of AssumeRoleWithWebIdentity and TagSession in one statement."""
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[
+                Statement(
+                    Effect="Allow",
+                    Principal={"Federated": "arn:aws:iam::123:oidc-provider/accounts.google.com"},
+                    Action=["sts:AssumeRoleWithWebIdentity", "sts:TagSession"],
+                ),
+            ],
+        )
+        assert is_trust_policy(policy) is True
+
+    def test_all_three_assume_types_combined(self):
+        """Policy mixing AssumeRole, AssumeRoleWithSAML, AssumeRoleWithWebIdentity."""
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[
+                Statement(
+                    Sid="AllowStandardAssume",
+                    Effect="Allow",
+                    Principal={"AWS": "arn:aws:iam::123:root"},
+                    Action="sts:AssumeRole",
+                ),
+                Statement(
+                    Sid="AllowSAML",
+                    Effect="Allow",
+                    Principal={"Federated": "arn:aws:iam::123:saml-provider/Corp"},
+                    Action="sts:AssumeRoleWithSAML",
+                ),
+                Statement(
+                    Sid="AllowOIDC",
+                    Effect="Allow",
+                    Principal={"Federated": "arn:aws:iam::123:oidc-provider/accounts.google.com"},
+                    Action="sts:AssumeRoleWithWebIdentity",
+                ),
+            ],
+        )
+        assert is_trust_policy(policy) is True
+
+
+class TestDetectPolicyType:
+    """Unit tests for ``detect_policy_type`` per the auto-detection plan."""
+
+    def test_detect_policy_type_identifies_trust(self):
+        """Trust-shaped → TRUST_POLICY."""
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[
+                Statement(
+                    Effect="Allow",
+                    Principal={"Service": "lambda.amazonaws.com"},
+                    Action="sts:AssumeRole",
+                )
+            ],
+        )
+        assert detect_policy_type(policy) == "TRUST_POLICY"
+
+    def test_detect_policy_type_resource_policy_with_principal(self):
+        """Principal but non-assume action → RESOURCE_POLICY."""
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[
+                Statement(
+                    Effect="Allow",
+                    Principal="*",
+                    Action="s3:GetObject",
+                    Resource="arn:aws:s3:::public-bucket/*",
+                )
+            ],
+        )
+        assert detect_policy_type(policy) == "RESOURCE_POLICY"
+
+    def test_detect_policy_type_defaults_to_identity(self):
+        """No Principal → IDENTITY_POLICY."""
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[
+                Statement(
+                    Effect="Allow",
+                    Action="s3:GetObject",
+                    Resource="arn:aws:s3:::bucket/*",
+                )
+            ],
+        )
+        assert detect_policy_type(policy) == "IDENTITY_POLICY"
+
+    def test_detect_policy_type_rejects_trust_with_specific_resource(self):
+        """sts:AssumeRole + specific resource ARN → RESOURCE_POLICY, not TRUST_POLICY.
+
+        Confirms the conservative trust detector still refuses to claim
+        policies with a specific role ARN as their Resource.
+        """
+        policy = IAMPolicy(
+            Version="2012-10-17",
+            Statement=[
+                Statement(
+                    Effect="Allow",
+                    Principal={"AWS": "arn:aws:iam::123:root"},
+                    Action="sts:AssumeRole",
+                    Resource="arn:aws:iam::123:role/MyRole",
+                )
+            ],
+        )
+        assert detect_policy_type(policy) == "RESOURCE_POLICY"

@@ -1,11 +1,11 @@
 ---
 title: Validation Checks
-description: All 21 built-in validation checks
+description: All 23 built-in validation checks
 ---
 
 # Validation Checks
 
-IAM Policy Validator includes 21 built-in checks across three categories.
+IAM Policy Validator includes 23 built-in checks across three categories.
 
 ## Check Categories
 
@@ -27,7 +27,7 @@ IAM Policy Validator includes 21 built-in checks across three categories.
 
     [:octicons-arrow-right-24: Security Checks](security-checks.md)
 
--   :material-cog-outline:{ .lg .middle } **Advanced Checks (3)**
+-   :material-cog-outline:{ .lg .middle } **Advanced Checks (5)**
 
     ---
 
@@ -49,7 +49,7 @@ IAM Policy Validator includes 21 built-in checks across three categories.
 | `resource_validation`      | error    | Resource ARN format                           |
 | `policy_structure`         | error    | Required fields, valid values, version check  |
 | `policy_size`              | error    | Character size limits (including SCP)         |
-| `sid_uniqueness`           | warning  | Unique SIDs                                   |
+| `sid_uniqueness`           | error    | Unique SIDs                                   |
 | `set_operator_validation`  | error    | ForAllValues/ForAnyValue usage                |
 | `ifexists_condition_usage` | warning  | IfExists condition validation                 |
 | `not_principal_validation` | warning  | NotPrincipal usage patterns                   |
@@ -71,9 +71,11 @@ IAM Policy Validator includes 21 built-in checks across three categories.
 
 | Check ID                       | Severity | Description                              |
 | ------------------------------ | -------- | ---------------------------------------- |
-| `action_condition_enforcement` | error    | Required conditions                      |
+| `action_condition_enforcement` | high     | Required conditions                      |
 | `action_resource_matching`     | medium   | Action-resource compatibility            |
 | `trust_policy_validation`      | high     | Trust policy structure + confused deputy |
+| `policy_type_validation`       | error    | Policy-type-specific requirements        |
+| `rcp_best_practices`           | medium   | RCP blanket denies + service carve-outs  |
 
 ## Severity Levels
 

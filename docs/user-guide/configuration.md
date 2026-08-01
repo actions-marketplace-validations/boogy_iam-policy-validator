@@ -90,6 +90,65 @@ wildcard_resource:
   hide_severities: [low]
 ```
 
+### suppress_superseded_findings
+
+When a statement contains `Action: "*"` and `Resource: "*"` with no conditions, every
+other check produces a redundant finding — the root cause and the fix are always the
+same: scope down the wildcard. This setting collapses all of that noise into one
+`critical` finding from `full_wildcard`.
+
+```yaml
+settings:
+  suppress_superseded_findings: true # default: true
+```
+
+**What gets suppressed**
+
+When `full_wildcard` fires on a statement, all other findings for **that statement
+only** are dropped — both statement-level checks (built-in and custom) and policy-level
+check findings that reference that statement index. The suppressed check IDs are listed
+inside the `full_wildcard` finding message so nothing is lost silently:
+
+```
+Statement allows all actions on all resources - CRITICAL SECURITY RISK
+
+**20 checks suppressed** for this statement (abac_enforcement,
+action_condition_enforcement, action_resource_matching, …).
+Scope the statement and re-run to see remaining findings.
+```
+
+**What is never suppressed**
+
+| Statement                             | Suppression                                      |
+| ------------------------------------- | ------------------------------------------------ |
+| `Deny */*`                            | No — `full_wildcard` only fires on `Allow`       |
+| `Allow NotAction: "*"`                | No — inverted semantics require full analysis    |
+| Sibling statements in the same policy | No — only the `*/*` statement is short-circuited |
+| `full_wildcard` itself                | Never suppressed                                 |
+
+!!! note "Conditions do not prevent suppression"
+    `Allow */* + Condition: {...}` is still treated as a full-wildcard statement.
+    The condition does not change the root cause or the fix, so suppression still
+    applies. The `full_wildcard` finding lists all suppressed checks so nothing is
+    lost silently.
+
+**Custom checks**
+
+Custom checks loaded via `--custom-checks-dir` are suppressed automatically — no
+changes to the check code required.
+
+**Opt out**
+
+```yaml
+settings:
+  suppress_superseded_findings: false
+```
+
+!!! warning "PR comment fingerprint churn"
+Switching from `false` to `true` (or vice versa) causes a one-time churn of
+existing PR comments anchored to the now-suppressed (or now-visible) check IDs.
+Re-run the validator once after changing this setting to refresh comment state.
+
 ## Check Configuration
 
 ### Disable a Check
@@ -273,6 +332,9 @@ settings:
     null # Hide these severities from output
     # Example: [low, info]
 
+  # Noise reduction
+  suppress_superseded_findings: true # Collapse */* noise into one finding (default: true)
+
   # AWS service definitions
   aws_services_dir: null # Path to offline service definitions
   cache_enabled: true # Cache AWS definitions (default: true)
@@ -286,6 +348,13 @@ settings:
     error: "iam-validity-error"
     critical: "iam-security-critical"
     high: "iam-security-high"
+
+  # Optional run scope tag (1-32 chars, [A-Za-z0-9._-]) appended to PR
+  # summary, review, analyzer, and ignored-findings markers. Set this
+  # when you run the validator multiple times against the same PR (e.g.
+  # one run per policy type) so each run keeps its own comment thread
+  # instead of overwriting the others. Unset by default.
+  comment_tag: null
 
   # Custom checks
   custom_checks_dir: null # Auto-discover checks from directory
@@ -342,7 +411,7 @@ Each check can be configured at the top level using its `check_id`:
 
 ### Built-in Checks
 
-All 21 built-in checks with their default settings:
+All 22 built-in checks with their default settings:
 
 #### AWS Validation Checks
 
@@ -497,6 +566,70 @@ policy_size:
 
 !!! note "SCP Size Validation"
 When using `--policy-type SERVICE_CONTROL_POLICY`, the SCP-specific size limit of 5,120 characters is enforced separately, which is stricter than the managed policy limit of 6,144 characters.
+
+## Policy Type Resolution
+
+When the validator runs, each policy file gets a resolved `PolicyType` that
+drives type-specific checks (for example `policy_size` limits and the
+`policy_type_validation` rules). There are two mutually exclusive modes:
+
+- **If `--policy-type` is supplied on the CLI** — that value is applied to
+  every policy in the run, full stop. Auto-detection and the `policy_types:`
+  glob mapping are skipped. Use this when your pipeline only ever validates
+  one type of policy.
+- **If `--policy-type` is omitted** — the type is resolved per file in this
+  priority order:
+  1. `policy_types:` glob mapping in the config (first match wins).
+  2. Content auto-detection: a trust-shaped statement (Principal + exact
+     `sts:AssumeRole*` action + `Effect: Allow` + no specific resource ARN)
+     resolves to `TRUST_POLICY`; any other Principal/NotPrincipal resolves
+     to `RESOURCE_POLICY`; otherwise `IDENTITY_POLICY`.
+  3. Default fallback: `IDENTITY_POLICY`.
+
+SCP and RCP cannot be auto-detected from content alone (they look
+structurally identical to identity/resource policies). Use the glob mapping
+or the explicit flag to drive those types. As a safety net, a policy whose
+statements all match the customer-RCP shape (`Deny` + `Principal: "*"` +
+service-prefixed actions + `Resource: "*"`) gets an info-level
+`policy_type_hint` recommending `RESOURCE_CONTROL_POLICY`.
+
+### `policy_types:` — per-file glob mapping
+
+```yaml
+policy_types:
+  - pattern: "**/scp/*.json"
+    type: SERVICE_CONTROL_POLICY
+  - pattern: "**/rcp/*.json"
+    type: RESOURCE_CONTROL_POLICY
+  - pattern: "**/trust-policies/*.json"
+    type: TRUST_POLICY
+```
+
+- Patterns are matched against the POSIX form of each policy file path.
+- A leading `**/` is stripped automatically so `**/scp/*.json` also matches
+  `scp/org.json` at the top of the scan.
+- First match wins; the list is only consulted when `--policy-type` is not
+  provided on the CLI.
+
+### Debugging the resolved type
+
+Run with `--log-level debug` (or `--verbose`) to see exactly what type each
+policy got and why:
+
+```
+policy_type=TRUST_POLICY source=cli-flag file=trust.json
+policy_type=SERVICE_CONTROL_POLICY source=config-glob pattern_present=true pattern_len=14 file=org.json
+policy_type=RESOURCE_POLICY source=auto-detect file=s3-bucket.json
+policy_type=IDENTITY_POLICY source=default file=ro.json
+```
+
+Only the file basename is logged (not the absolute path) and the
+`config-glob` line reports `pattern_present=true` plus `pattern_len=<n>`
+instead of the raw glob — this keeps the debug output free of
+user-controlled content while still letting you grep by source:
+`iam-validator validate ... --verbose 2>&1 | rg 'source='`. The glob
+itself is already visible in your own `iam-validator.yaml`, so there is
+no information loss for auditing.
 
 ## Full Reference
 

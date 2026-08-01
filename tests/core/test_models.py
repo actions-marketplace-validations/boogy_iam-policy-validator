@@ -232,6 +232,54 @@ class TestValidationIssue:
         assert expected_icon in comment
         assert expected_label in comment
 
+    def test_to_pr_comment_includes_check_id(self):
+        """check_id appears with separator in PR comment output."""
+        issue = ValidationIssue(
+            severity="error",
+            statement_index=0,
+            issue_type="invalid_action",
+            message="Invalid action 's3:GetObjekt' does not exist",
+            check_id="action_validation",
+        )
+
+        comment = issue.to_pr_comment(include_identifier=False)
+
+        assert "*Check: `action_validation`*" in comment
+        assert "---" in comment
+
+    def test_to_pr_comment_without_check_id(self):
+        """No check_id section when check_id is None."""
+        issue = ValidationIssue(
+            severity="error",
+            statement_index=0,
+            issue_type="invalid_action",
+            message="Invalid action",
+            check_id=None,
+        )
+
+        comment = issue.to_pr_comment(include_identifier=False)
+
+        assert "*Check:" not in comment
+
+    def test_to_pr_comment_check_id_after_details_section(self):
+        """check_id is rendered AFTER the closing </details> tag."""
+        issue = ValidationIssue(
+            severity="error",
+            statement_index=0,
+            issue_type="invalid_action",
+            message="Invalid action",
+            action="s3:GetObjekt",
+            suggestion="Use s3:GetObject instead",
+            check_id="action_validation",
+        )
+
+        comment = issue.to_pr_comment(include_identifier=False)
+
+        details_end = comment.find("</details>")
+        check_id_pos = comment.find("*Check: `action_validation`*")
+        assert details_end != -1
+        assert check_id_pos > details_end
+
 
 class TestPolicyValidationResult:
     """Test the PolicyValidationResult model."""
@@ -270,7 +318,10 @@ class TestValidationReport:
 
         summary = report.get_summary()
         assert "25 policies" in summary
-        assert "20 valid" in summary
+        # With no results attached, fall back to total_policies - invalid_policies
+        # so a failing run is not mis-reported as fully clean.
+        assert "20 clean" in summary
+        assert "5 with errors" in summary
 
     def test_report_with_results(self):
         """Test report with validation results."""
@@ -286,3 +337,138 @@ class TestValidationReport:
             total_policies=2, valid_policies=1, invalid_policies=1, total_issues=1, results=results
         )
         assert len(report.results) == 2
+
+    def _make_result(self, name: str, severities: list[str]) -> PolicyValidationResult:
+        """Build a result with one issue per severity."""
+        return PolicyValidationResult(
+            policy_file=name,
+            is_valid=not severities,
+            issues=[ValidationIssue(severity=s, statement_index=0, issue_type="t", message="m") for s in severities],
+        )
+
+    def test_policies_with_errors_counts_error_severity_only(self):
+        """Only policies with >=1 error-severity issue are counted."""
+        results = [
+            self._make_result("error_only.json", ["error"]),
+            self._make_result("high_only.json", ["high"]),
+            self._make_result("warning_only.json", ["warning"]),
+            self._make_result("error_plus_high.json", ["error", "high"]),
+            self._make_result("clean.json", []),
+        ]
+        report = ValidationReport(
+            total_policies=5, valid_policies=3, invalid_policies=2, total_issues=5, results=results
+        )
+        # error_only + error_plus_high
+        assert report.policies_with_errors == 2
+
+    def test_policies_with_findings_excludes_error_only(self):
+        """Policies whose only issues are error-severity are NOT findings."""
+        results = [
+            self._make_result("error_only.json", ["error"]),
+            self._make_result("high_only.json", ["high"]),
+            self._make_result("warning_only.json", ["warning"]),
+            self._make_result("info_only.json", ["info"]),
+            self._make_result("error_plus_high.json", ["error", "high"]),
+            self._make_result("clean.json", []),
+        ]
+        report = ValidationReport(
+            total_policies=6, valid_policies=4, invalid_policies=2, total_issues=6, results=results
+        )
+        # high_only + warning_only + info_only + error_plus_high (has non-error)
+        assert report.policies_with_findings == 4
+
+    def test_error_plus_finding_counted_in_both(self):
+        """A policy with both error AND finding severities appears in both counts."""
+        results = [self._make_result("mixed.json", ["error", "critical"])]
+        report = ValidationReport(
+            total_policies=1, valid_policies=0, invalid_policies=1, total_issues=2, results=results
+        )
+        assert report.policies_with_errors == 1
+        assert report.policies_with_findings == 1
+
+    def test_empty_results_returns_zero(self):
+        """Both properties return 0 when results list is empty."""
+        report = ValidationReport(total_policies=0, valid_policies=0, invalid_policies=0, total_issues=0, results=[])
+        assert report.policies_with_errors == 0
+        assert report.policies_with_findings == 0
+
+    def test_computed_properties_serialize_to_dict(self):
+        """@computed_field properties must appear in model_dump() so JSON output includes them."""
+        results = [
+            self._make_result("A.json", ["error"]),
+            self._make_result("B.json", ["warning"]),
+        ]
+        report = ValidationReport(
+            total_policies=2, valid_policies=1, invalid_policies=1, total_issues=2, results=results
+        )
+        dumped = report.model_dump()
+        assert "policies_with_errors" in dumped
+        assert "policies_with_findings" in dumped
+        assert dumped["policies_with_errors"] == 1
+        assert dumped["policies_with_findings"] == 1
+
+    def test_get_summary_with_both_errors_and_findings(self):
+        """Summary reports both counts when policies have both kinds of issues."""
+        results = [
+            self._make_result("a.json", ["error"]),
+            self._make_result("b.json", ["high"]),
+            self._make_result("c.json", ["error", "high"]),
+            self._make_result("d.json", []),
+        ]
+        report = ValidationReport(
+            total_policies=4, valid_policies=1, invalid_policies=2, total_issues=4, results=results
+        )
+        summary = report.get_summary()
+        assert "1 clean" in summary
+        assert "2 with errors" in summary
+        assert "2 with findings" in summary
+
+
+class TestIsFullWildcardAllow:
+    """Tests for Statement.is_full_wildcard_allow()."""
+
+    def test_allow_star_star_returns_true(self):
+        s = Statement(Effect="Allow", Action="*", Resource="*")
+        assert s.is_full_wildcard_allow() is True
+
+    def test_allow_list_star_list_star_returns_true(self):
+        s = Statement(Effect="Allow", Action=["*"], Resource=["*"])
+        assert s.is_full_wildcard_allow() is True
+
+    def test_allow_duplicate_star_returns_true(self):
+        s = Statement(Effect="Allow", Action=["*", "*"], Resource=["*", "*"])
+        assert s.is_full_wildcard_allow() is True
+
+    def test_allow_star_action_list_resource_returns_true(self):
+        s = Statement(Effect="Allow", Action="*", Resource=["*"])
+        assert s.is_full_wildcard_allow() is True
+
+    def test_deny_star_star_returns_false(self):
+        s = Statement(Effect="Deny", Action="*", Resource="*")
+        assert s.is_full_wildcard_allow() is False
+
+    def test_allow_star_star_with_condition_returns_true(self):
+        s = Statement(
+            Effect="Allow", Action="*", Resource="*", Condition={"Bool": {"aws:MultiFactorAuthPresent": "true"}}
+        )
+        assert s.is_full_wildcard_allow() is True
+
+    def test_allow_not_action_returns_false(self):
+        s = Statement(Effect="Allow", NotAction="*", Resource="*")
+        assert s.is_full_wildcard_allow() is False
+
+    def test_allow_not_resource_returns_false(self):
+        s = Statement(Effect="Allow", Action="*", NotResource="*")
+        assert s.is_full_wildcard_allow() is False
+
+    def test_allow_star_mixed_resources_returns_false(self):
+        s = Statement(Effect="Allow", Action=["*"], Resource=["*", "arn:aws:s3:::bucket"])
+        assert s.is_full_wildcard_allow() is False
+
+    def test_allow_star_action_absent_resource_returns_false(self):
+        s = Statement(Effect="Allow", Action="*")
+        assert s.is_full_wildcard_allow() is False
+
+    def test_allow_absent_action_star_resource_returns_false(self):
+        s = Statement(Effect="Allow", Resource="*")
+        assert s.is_full_wildcard_allow() is False

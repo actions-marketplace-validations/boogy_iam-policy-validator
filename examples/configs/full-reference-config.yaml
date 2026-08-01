@@ -128,7 +128,7 @@ settings:
   #   - _services.json: List of all services (underscore prefix for easy discovery)
   #   - {service}.json: Individual service definition files (e.g., s3.json, ec2.json)
   #
-  # You can download these files using: make download-aws-services
+  # You can download these files using: mise run download-aws-services
   # This will create an aws_services/ directory with all service definitions
   #
   # Examples:
@@ -165,6 +165,19 @@ settings:
   # Valid values: "error", "warning", "info", "critical", "high", "medium", "low"
   # Example: ["low", "info"] - hide low and info severity findings
   hide_severities: None
+
+  # How to handle findings on lines outside the PR diff
+  # Controls whether off-diff issues get individual review comments or are
+  # consolidated in the summary table. Reduces PR noise for large policies
+  # where only a small section changed.
+  #
+  # Available modes:
+  #   summary_only:              Show in summary table only (default, least noise)
+  #   individual:                Post each as an individual review comment
+  #   modified_statements_only:  Individual comments for issues in modified
+  #                              statements only; unchanged statement issues
+  #                              go to summary
+  off_diff_comment_mode: summary_only
 
   # GitHub PR label mapping based on severity findings
   # When issues with these severities are found, apply the corresponding labels to the PR
@@ -622,9 +635,33 @@ policy_type_validation:
   description: "Validates policies match declared type and enforces RCP requirements"
   # RCP validation includes:
   #  - Must have Effect: Deny (RCPs are deny-only)
-  #  - Must target specific resource types (no wildcards)
-  #  - Principal must be "*" (applies to all)
+  #  - Principal must be "*" (applies to all; restrict via Condition)
+  #  - Actions must come from RCP-supported services (26 service prefixes,
+  #    see constants.RCP_SUPPORTED_SERVICES); bare "*" Action is rejected
+  #  - NotAction / NotPrincipal are not supported
+  # Extra service prefixes to accept as RCP-supported (for AWS launches newer
+  # than this validator release):
+  # additional_rcp_services:
+  #   - "newservice"
+  # SCP validation: no Principal/NotPrincipal, 5,120-char size limit. Allow
+  # statements may use Condition, scoped resource ARNs, NotAction and
+  # NotResource (full IAM policy language, AWS launch 2025-09-19).
   # ignore_patterns available - see top of file for usage examples
+
+# ============================================================================
+# 13b. RCP BEST PRACTICES
+# ============================================================================
+# Best-practice guidance for Resource Control Policies (runs only when the
+# resolved policy type is RESOURCE_CONTROL_POLICY):
+#  - rcp_blanket_deny (low): Deny with no Condition blocks ALL principals,
+#    including your own org's admins — confirm intent
+#  - rcp_missing_service_carveout (medium): an org-boundary deny without
+#    `BoolIfExists aws:PrincipalIsAWSService: false` can break AWS
+#    service-to-service calls (canonical AWS identity-perimeter pattern)
+rcp_best_practices:
+  enabled: true
+  severity: medium
+  description: "Best-practice guidance for RCP deny statements (blanket denies, service carve-outs)"
 
 # ============================================================================
 # 14. ACTION-RESOURCE MATCHING

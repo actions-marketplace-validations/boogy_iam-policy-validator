@@ -54,7 +54,7 @@ iam-validator validate [OPTIONS]
 | Option                | Description                                                                                                   | Default           |
 | --------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------- |
 | `--config`, `-c`      | Path to configuration file                                                                                    | Auto-detect       |
-| `--policy-type`, `-t` | Policy type (IDENTITY_POLICY, RESOURCE_POLICY, TRUST_POLICY, SERVICE_CONTROL_POLICY, RESOURCE_CONTROL_POLICY) | `IDENTITY_POLICY` |
+| `--policy-type`, `-t` | Policy type (IDENTITY_POLICY, RESOURCE_POLICY, TRUST_POLICY, SERVICE_CONTROL_POLICY, RESOURCE_CONTROL_POLICY). When omitted, each policy's type is auto-resolved per file (config `policy_types:` glob → content detection → IDENTITY_POLICY). See [Policy Type Resolution](configuration.md#policy-type-resolution). | _auto-detect_ |
 | `--fail-on-warnings`  | Fail validation if warnings are found                                                                         | `false`           |
 | `--no-recursive`      | Don't recursively search directories                                                                          | `false`           |
 | `--custom-checks-dir` | Path to directory containing custom checks                                                                    |                   |
@@ -69,13 +69,14 @@ iam-validator validate [OPTIONS]
 
 **GitHub Integration:**
 
-| Option                 | Description                                              | Default |
-| ---------------------- | -------------------------------------------------------- | ------- |
-| `--github-comment`     | Post summary comment to PR conversation                  | `false` |
-| `--github-review`      | Create line-specific review comments on PR files         | `false` |
-| `--github-summary`     | Write summary to GitHub Actions job summary              | `false` |
-| `--allow-owner-ignore` | Allow CODEOWNERS to ignore findings by replying 'ignore' | `true`  |
-| `--no-owner-ignore`    | Disable CODEOWNERS ignore feature                        | `false` |
+| Option                 | Description                                                                | Default |
+| ---------------------- | -------------------------------------------------------------------------- | ------- |
+| `--github-comment`     | Post summary comment to PR conversation                                    | `false` |
+| `--github-review`      | Create line-specific review comments on PR files                           | `false` |
+| `--github-summary`     | Write summary to GitHub Actions job summary                                | `false` |
+| `--allow-owner-ignore` | Allow CODEOWNERS to ignore findings by replying 'ignore'                   | `true`  |
+| `--no-owner-ignore`    | Disable CODEOWNERS ignore feature                                          | `false` |
+| `--comment-tag`        | Run scope tag (1-32 chars, `[A-Za-z0-9._-]`) for parallel runs on same PR  | unset   |
 
 **CI Mode:**
 

@@ -19,6 +19,7 @@
 - [What Does It Check?](#what-does-it-check)
 - [Installation & Usage](#installation--usage)
 - [MCP Server](#mcp-server)
+- [Claude Code Skill](#claude-code-skill)
 - [AWS Access Analyzer (Optional)](#aws-access-analyzer-optional)
 - [Comparison with Other Tools](#comparison-with-other-tools)
 - [Documentation](#documentation)
@@ -311,6 +312,9 @@ iam-validator validate --path policies/ --aws-services-dir ./aws-services
 - **Line-specific feedback**: Inline comments on policy files with exact line numbers
 - **Smart cleanup**: Updates existing comments, removes stale ones
 - **Severity-based reviews**: Auto-approve or request changes based on findings
+- **Parallel-run safe**: Pass a `comment-tag` per matrix job (e.g. one
+  per policy type) so independent runs keep independent comment threads
+  on the same PR instead of overwriting each other
 
 **Multiple output formats:** Console, JSON, SARIF (GitHub Code Scanning), Markdown, HTML, CSV
 
@@ -323,6 +327,7 @@ iam-validator validate --path policies/ --aws-services-dir ./aws-services
     create-review: true # Inline PR comments
     github-summary: true # Actions summary tab
     config-file: .iam-validator.yaml # fail_on_severity set in config
+    comment-tag: identity # Required only when running >1 validator on the same PR
 ```
 
 ---
@@ -394,7 +399,10 @@ iam-validator validate --path policies/
 # With AWS Access Analyzer (requires AWS credentials)
 iam-validator analyze --path policies/ --run-all-checks
 
-# Different policy types
+# Policy type auto-detection (mix identity, trust, resource policies in one run)
+iam-validator validate --path policies/
+
+# Or pin a single policy type explicitly
 iam-validator validate --path trust-policies/ --policy-type TRUST_POLICY
 
 # Output formats
@@ -479,7 +487,7 @@ For the full configuration reference including how `action_condition_enforcement
 
 ## MCP Server
 
-Use the IAM Policy Validator as an [MCP](https://modelcontextprotocol.io/) server for AI assistants like Claude Desktop. Provides 36 tools across validation, policy generation, AWS service querying, analysis, and organization config management.
+Use the IAM Policy Validator as an [MCP](https://modelcontextprotocol.io/) server for AI assistants like Claude Desktop. Provides 33 tools across validation, generation, AWS service querying, analysis, AWS Access Analyzer, and organization config management — plus tag-based `--profile` gating to slim the per-turn token cost.
 
 ```bash
 # Quick start with uvx (no installation needed)
@@ -487,10 +495,26 @@ uvx --from "iam-policy-validator[mcp]" iam-validator-mcp
 
 # Or install with MCP extras
 pip install "iam-policy-validator[mcp]"
-iam-validator-mcp
+iam-validator-mcp                                      # all 33 tools (default)
+iam-validator-mcp --profile validate-only              # 5 validation tools only
+iam-validator-mcp --custom-checks-dir ./my-checks      # CLI parity: custom checks
+iam-validator-mcp --aws-services-dir ./aws-services    # CLI parity: offline AWS data
 ```
 
-See the [MCP Server Documentation](https://boogy.github.io/iam-policy-validator/integrations/mcp-server/) for Claude Desktop configuration and tool reference.
+See the [MCP Server Documentation](https://boogy.github.io/iam-policy-validator/integrations/mcp-server/) for Claude Desktop configuration, tool reference, and the profile taxonomy.
+
+---
+
+## Claude Code Skill
+
+Prefer the CLI over running an MCP server? Install the official [Claude Code](https://docs.claude.com/en/docs/claude-code) skill. It teaches Claude Code how to drive the `iam-validator` CLI for validation, analysis, and AWS service queries — no MCP process required.
+
+```text
+/plugin marketplace add boogy/iam-policy-validator
+/plugin install iam-policy-validator@iam-policy-validator
+```
+
+See the [Claude Code Skill Documentation](https://boogy.github.io/iam-policy-validator/integrations/claude-code-skill/) for details.
 
 ---
 
@@ -553,6 +577,7 @@ iam-validator analyze --path new-policy.json \
 - [GitHub Actions Guide](https://boogy.github.io/iam-policy-validator/integrations/github-actions/) - CI/CD integration
 - [Python Library Guide](https://boogy.github.io/iam-policy-validator/developer-guide/sdk/) - Use as Python package
 - [MCP Server Guide](https://boogy.github.io/iam-policy-validator/integrations/mcp-server/) - AI assistant integration
+- [Claude Code Skill Guide](https://boogy.github.io/iam-policy-validator/integrations/claude-code-skill/) - CLI-based Claude Code plugin
 - [Trust Policy Examples](https://github.com/boogy/iam-policy-validator/tree/main/examples/trust-policies) - Trust policy validation examples
 - [Configuration Examples](https://github.com/boogy/iam-policy-validator/tree/main/examples/configs) - Config file templates
 - [Custom Checks](https://boogy.github.io/iam-policy-validator/developer-guide/custom-checks/) - Add your own validation rules

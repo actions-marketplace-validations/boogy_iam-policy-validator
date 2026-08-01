@@ -45,6 +45,11 @@ from iam_validator.core.config.wildcards import (
 #    - medium:   Medium security risk (e.g., overly permissive wildcards)
 #    - low:      Low security risk (e.g., minor best practice violations)
 #
+# 3. SPECIAL SEVERITIES:
+#    - none:     Suppressed — issue is filtered out and never shown in any output
+#               (useful for checks that conditionally suppress findings, e.g.,
+#                ABAC-mitigated service wildcards)
+#
 # Use 'error' for policy validity issues, and 'critical/high/medium/low' for
 # security best practices. This distinction helps separate "broken policies"
 # from "insecure but valid policies".
@@ -118,6 +123,18 @@ DEFAULT_CONFIG = {
         # Valid values: "error", "warning", "info", "critical", "high", "medium", "low"
         # Example: ["low", "info"] - hide low and info severity findings
         "hide_severities": None,
+        # How to handle findings on lines outside the PR diff
+        # summary_only: Show in summary table only (default, least noise)
+        # individual: Post each as an individual review comment
+        # modified_statements_only: Individual comments for modified statements only
+        "off_diff_comment_mode": "summary_only",
+        # Optional run scope tag (1-32 chars, [A-Za-z0-9._-]) appended to the
+        # PR summary, review, ignored-findings, and analyzer markers. Allows
+        # multiple runs on the same PR (e.g. one per policy type) to keep
+        # independent comment threads. None preserves legacy un-scoped markers.
+        "comment_tag": None,
+        # Suppress redundant findings for statements already flagged by full_wildcard.
+        "suppress_superseded_findings": True,
     },
     # ========================================================================
     # AWS IAM Validation Checks (17 checks total)
@@ -139,17 +156,26 @@ DEFAULT_CONFIG = {
     # ========================================================================
     # 2. POLICY SIZE
     # ========================================================================
-    # Validate policy size against AWS limits
-    # Policy type determines which AWS limit to enforce:
-    #   - managed: 6144 characters (excluding whitespace)
-    #   - inline_user: 2048 characters
-    #   - inline_group: 5120 characters
-    #   - inline_role: 10240 characters
+    # Validate policy size against AWS limits. When no explicit policy_type is
+    # set here, the check derives the correct AWS limit from the runtime
+    # --policy-type (IDENTITY_POLICY → managed, TRUST_POLICY → inline_role_trust,
+    # SERVICE_CONTROL_POLICY → scp, RESOURCE_CONTROL_POLICY → rcp).
+    #
+    # Override by setting `policy_type` here when you know the deployment target
+    # is more specific than the runtime type — e.g. an identity policy that will
+    # actually be attached inline to an IAM user:
+    #
+    #   policy_size:
+    #     config:
+    #       policy_type: inline_user  # 2048 bytes
+    #
+    # Valid keys: managed (6144), inline_user (2048), inline_group (5120),
+    #             inline_role (10240), inline_role_trust (2048), scp (5120),
+    #             rcp (5120).
     "policy_size": {
         "enabled": True,
         "severity": "error",  # IAM validity error
         "description": "Validates that IAM policies don't exceed AWS size limits",
-        "policy_type": "managed",  # Change based on your policy type
     },
     # ========================================================================
     # 3. ACTION VALIDATION
@@ -325,6 +351,25 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "severity": "error",  # IAM validity error
         "description": "Validates policies match declared type and enforces RCP requirements",
+        # Extra service prefixes to accept as RCP-supported, on top of the
+        # built-in constants.RCP_SUPPORTED_SERVICES list — lets users track
+        # new AWS RCP launches without waiting for a validator release.
+        "additional_rcp_services": [],
+    },
+    # ========================================================================
+    # 11b. RCP BEST PRACTICES
+    # ========================================================================
+    # Best-practice guidance for Resource Control Policies (only runs when the
+    # resolved policy type is RESOURCE_CONTROL_POLICY):
+    #  - rcp_blanket_deny (low): Deny with no Condition blocks ALL principals,
+    #    including your own org's admins — confirm intent
+    #  - rcp_missing_service_carveout (medium): org-boundary deny without the
+    #    canonical `BoolIfExists aws:PrincipalIsAWSService: false` carve-out
+    #    can break AWS service-to-service calls
+    "rcp_best_practices": {
+        "enabled": True,
+        "severity": "medium",
+        "description": "Best-practice guidance for RCP deny statements (blanket denies, service carve-outs)",
     },
     # ========================================================================
     # 12. ACTION-RESOURCE MATCHING
@@ -700,6 +745,156 @@ DEFAULT_CONFIG = {
                     "    },\n"
                     '    "ArnLike": {\n'
                     '      "iam:AssociatedResourceArn": "arn:aws:ec2:*:*:instance/*"\n'
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+            },
+            # Glue dev endpoint privilege escalation
+            {
+                "all_of": ["glue:CreateDevEndpoint", "iam:PassRole"],
+                "severity": "high",
+                "message": "Policy grants {actions} across statements - enables privilege escalation via Glue dev endpoint. {statements}",
+                "suggestion": (
+                    "This combination allows creating a Glue development endpoint with a "
+                    "privileged role attached, then using the endpoint (e.g. via SSH) to "
+                    "act with that role's permissions.\n\n"
+                    "Mitigation options:\n"
+                    "• Add iam:PassedToService condition requiring glue.amazonaws.com\n"
+                    "• Limit PassRole to specific low-privilege roles\n"
+                    "• Remove glue:CreateDevEndpoint if not needed"
+                ),
+                "example": (
+                    "{\n"
+                    '  "Condition": {\n'
+                    '    "StringEquals": {\n'
+                    '      "iam:PassedToService": "glue.amazonaws.com"\n'
+                    "    },\n"
+                    '    "ArnLike": {\n'
+                    '      "iam:PolicyARN": "arn:aws:iam::*:role/glue-limited-*"\n'
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+            },
+            # CloudFormation stack privilege escalation
+            {
+                "all_of": ["cloudformation:CreateStack", "iam:PassRole"],
+                "severity": "high",
+                "message": "Policy grants {actions} across statements - enables privilege escalation via CloudFormation service role. {statements}",
+                "suggestion": (
+                    "This combination allows launching a CloudFormation stack with a "
+                    "privileged service role; the stack template can then create or "
+                    "modify any resource that role permits (including IAM).\n\n"
+                    "Mitigation options:\n"
+                    "• Add iam:PassedToService condition requiring cloudformation.amazonaws.com\n"
+                    "• Limit PassRole to specific low-privilege stack roles\n"
+                    "• Restrict cloudformation:TemplateUrl to trusted buckets"
+                ),
+                "example": (
+                    "{\n"
+                    '  "Condition": {\n'
+                    '    "StringEquals": {\n'
+                    '      "iam:PassedToService": "cloudformation.amazonaws.com"\n'
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+            },
+            # SageMaker notebook privilege escalation
+            {
+                "all_of": ["sagemaker:CreateNotebookInstance", "iam:PassRole"],
+                "severity": "high",
+                "message": "Policy grants {actions} across statements - enables privilege escalation via SageMaker notebook role. {statements}",
+                "suggestion": (
+                    "This combination allows creating a SageMaker notebook instance with "
+                    "a privileged execution role, then running code in the notebook with "
+                    "that role's permissions.\n\n"
+                    "Mitigation options:\n"
+                    "• Add iam:PassedToService condition requiring sagemaker.amazonaws.com\n"
+                    "• Limit PassRole to specific low-privilege execution roles"
+                ),
+                "example": (
+                    "{\n"
+                    '  "Condition": {\n'
+                    '    "StringEquals": {\n'
+                    '      "iam:PassedToService": "sagemaker.amazonaws.com"\n'
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+            },
+            # SSM run-command lateral movement with a passable role
+            {
+                "all_of": ["ssm:SendCommand", "iam:PassRole"],
+                "severity": "high",
+                "message": "Policy grants {actions} across statements - enables privilege escalation via remote command execution. {statements}",
+                "suggestion": (
+                    "ssm:SendCommand executes commands on managed instances with the "
+                    "instance profile's permissions; combined with iam:PassRole the "
+                    "principal can also wire privileged roles onto resources it "
+                    "controls.\n\n"
+                    "Mitigation options:\n"
+                    "• Restrict ssm:SendCommand to specific instances or tags\n"
+                    "• Limit PassRole to specific low-privilege roles\n"
+                    "• Require aws:ResourceTag conditions on target instances"
+                ),
+                "example": (
+                    "{\n"
+                    '  "Condition": {\n'
+                    '    "StringEquals": {\n'
+                    '      "aws:ResourceTag/environment": "sandbox"\n'
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+            },
+            # CodeBuild project privilege escalation
+            {
+                "all_of": ["codebuild:CreateProject", "iam:PassRole"],
+                "severity": "high",
+                "message": "Policy grants {actions} across statements - enables privilege escalation via CodeBuild service role. {statements}",
+                "suggestion": (
+                    "This combination allows creating a CodeBuild project with a "
+                    "privileged service role; the buildspec then runs arbitrary "
+                    "commands with that role's permissions.\n\n"
+                    "Mitigation options:\n"
+                    "• Add iam:PassedToService condition requiring codebuild.amazonaws.com\n"
+                    "• Limit PassRole to specific low-privilege build roles"
+                ),
+                "example": (
+                    "{\n"
+                    '  "Condition": {\n'
+                    '    "StringEquals": {\n'
+                    '      "iam:PassedToService": "codebuild.amazonaws.com"\n'
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+            },
+            # Data Pipeline privilege escalation
+            {
+                "all_of": [
+                    "datapipeline:CreatePipeline",
+                    "datapipeline:PutPipelineDefinition",
+                    "iam:PassRole",
+                ],
+                "severity": "high",
+                "message": "Policy grants {actions} across statements - enables privilege escalation via Data Pipeline roles. {statements}",
+                "suggestion": (
+                    "This combination allows creating a Data Pipeline whose definition "
+                    "runs shell activities with a passed (potentially privileged) "
+                    "role.\n\n"
+                    "Mitigation options:\n"
+                    "• Add iam:PassedToService condition requiring datapipeline.amazonaws.com\n"
+                    "• Limit PassRole to specific low-privilege pipeline roles\n"
+                    "• Remove Data Pipeline permissions (the service is deprecated)"
+                ),
+                "example": (
+                    "{\n"
+                    '  "Condition": {\n'
+                    '    "StringEquals": {\n'
+                    '      "iam:PassedToService": "datapipeline.amazonaws.com"\n'
                     "    }\n"
                     "  }\n"
                     "}\n"

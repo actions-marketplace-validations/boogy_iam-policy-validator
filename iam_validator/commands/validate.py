@@ -13,6 +13,33 @@ from iam_validator.core.report import ReportGenerator
 from iam_validator.integrations.github_integration import GitHubIntegration
 
 
+def _resolve_off_diff_mode(args: argparse.Namespace, config) -> str:
+    """Resolve the off-diff comment mode from CLI args or config.
+
+    Priority: CLI ``--off-diff-comment-mode`` > config setting > default ``"summary_only"``.
+
+    Args:
+        args: Parsed command-line arguments
+        config: Loaded configuration object with ``get_setting()``
+
+    Returns:
+        One of ``"summary_only"``, ``"individual"``, or ``"modified_statements_only"``
+    """
+    return getattr(args, "off_diff_comment_mode", None) or config.get_setting("off_diff_comment_mode", "summary_only")
+
+
+def _resolve_comment_tag(args: argparse.Namespace, config) -> str | None:
+    """Resolve the PR comment tag from CLI args or config.
+
+    Priority: CLI ``--comment-tag`` > config ``comment_tag`` > unset.
+    The tag scopes PR comment markers so multiple validator runs on the
+    same PR (e.g. one per policy type) keep independent comment threads.
+    Returns ``None`` when neither source provides a value, preserving the
+    legacy un-scoped marker behaviour.
+    """
+    return getattr(args, "comment_tag", None) or config.get_setting("comment_tag", None)
+
+
 class ValidateCommand(Command):
     """Command to validate IAM policies."""
 
@@ -125,8 +152,13 @@ Examples:
                 "SERVICE_CONTROL_POLICY",
                 "RESOURCE_CONTROL_POLICY",
             ],
-            default="IDENTITY_POLICY",
-            help="Type of IAM policy being validated (default: IDENTITY_POLICY). "
+            default=None,
+            help="Type of IAM policy being validated. When omitted, each "
+            "policy's type is resolved per-file: config `policy_types:` glob "
+            "mapping first, then content auto-detection (trust vs resource "
+            "vs identity), then a fallback to IDENTITY_POLICY. When supplied, "
+            "this value is applied to every policy in the run and "
+            "auto-detection is skipped. "
             "IDENTITY_POLICY: Attached to users/groups/roles | "
             "RESOURCE_POLICY: S3/SNS/SQS policies | "
             "TRUST_POLICY: Role assumption policies | "
@@ -167,7 +199,19 @@ Examples:
 
         parser.add_argument(
             "--custom-checks-dir",
-            help="Path to directory containing custom checks for auto-discovery",
+            help="Path to directory containing custom checks for auto-discovery. "
+            "WARNING: every .py file in the directory is executed — only point "
+            "this at trusted code, and never enable it for workflows that run "
+            "on untrusted forks (e.g. pull_request_target)",
+        )
+
+        parser.add_argument(
+            "--allow-config-custom-checks",
+            action="store_true",
+            help="Allow auto-discovery of custom checks from a custom_checks_dir "
+            "set in the YAML config file. Without this flag (or an explicit "
+            "--custom-checks-dir), a config-referenced directory is ignored, "
+            "since discovery executes its Python code",
         )
 
         parser.add_argument(
@@ -213,6 +257,27 @@ Examples:
             "--no-owner-ignore",
             action="store_true",
             help="Disable CODEOWNERS ignore feature",
+        )
+
+        parser.add_argument(
+            "--off-diff-comment-mode",
+            choices=["summary_only", "individual", "modified_statements_only"],
+            default=None,
+            help="How to handle findings on unchanged lines in PRs: "
+            "'summary_only' (default) shows in summary table only, "
+            "'individual' posts each as a review comment, "
+            "'modified_statements_only' posts only for modified statements",
+        )
+
+        parser.add_argument(
+            "--comment-tag",
+            default=None,
+            metavar="TAG",
+            help="Optional run scope (1-32 chars, [A-Za-z0-9._-]) for PR "
+            "summary, review, and ignored-findings comments. When set, the "
+            "HTML markers are suffixed with ':<TAG>' so multiple validator "
+            "runs on the same PR (e.g. one per policy type) maintain "
+            "independent comment threads instead of overwriting each other.",
         )
 
         parser.add_argument(
@@ -282,13 +347,18 @@ Examples:
         config_path = getattr(args, "config", None)
         custom_checks_dir = getattr(args, "custom_checks_dir", None)
         aws_services_dir = getattr(args, "aws_services_dir", None)
-        policy_type = cast(PolicyType, getattr(args, "policy_type", "IDENTITY_POLICY"))
+        # None means "user didn't pass --policy-type" → orchestrator runs
+        # per-file resolution (glob → auto-detect → default). Only cast when
+        # the user actually supplied a value.
+        policy_type_arg = getattr(args, "policy_type", None)
+        policy_type: PolicyType | None = cast(PolicyType, policy_type_arg) if policy_type_arg else None
         results = await validate_policies(
             policies,
             config_path=config_path,
             custom_checks_dir=custom_checks_dir,
             policy_type=policy_type,
             aws_services_dir=aws_services_dir,
+            allow_config_custom_checks=getattr(args, "allow_config_custom_checks", False),
         )
 
         # Generate report (include parsing errors if any)
@@ -349,6 +419,10 @@ Examples:
                 enable_ignore = False
             allowed_users = ignore_settings.get("allowed_users", [])
 
+            # Get off-diff comment mode (CLI override > config > default)
+            off_diff_mode = _resolve_off_diff_mode(args, config)
+            comment_tag = _resolve_comment_tag(args, config)
+
             async with GitHubIntegration() as github:
                 commenter = PRCommenter(
                     github,
@@ -356,6 +430,8 @@ Examples:
                     severity_labels=severity_labels,
                     enable_codeowners_ignore=enable_ignore,
                     allowed_ignore_users=allowed_users,
+                    off_diff_comment_mode=off_diff_mode,
+                    comment_tag=comment_tag,
                 )
                 success = await commenter.post_findings_to_pr(
                     report,
@@ -408,6 +484,7 @@ Examples:
                 config_path=config_path,
                 custom_checks_dir=custom_checks_dir,
                 policy_type=policy_type,
+                allow_config_custom_checks=getattr(args, "allow_config_custom_checks", False),
             )
 
             if results:
@@ -501,6 +578,10 @@ Examples:
                 enable_ignore = False
             allowed_users = ignore_settings.get("allowed_users", [])
 
+            # Get off-diff comment mode (CLI override > config > default)
+            off_diff_mode = _resolve_off_diff_mode(args, config)
+            comment_tag = _resolve_comment_tag(args, config)
+
             async with GitHubIntegration() as github:
                 commenter = PRCommenter(
                     github,
@@ -508,6 +589,8 @@ Examples:
                     severity_labels=severity_labels,
                     enable_codeowners_ignore=enable_ignore,
                     allowed_ignore_users=allowed_users,
+                    off_diff_comment_mode=off_diff_mode,
+                    comment_tag=comment_tag,
                 )
                 success = await commenter.post_findings_to_pr(
                     report,
@@ -567,6 +650,10 @@ Examples:
                     enable_ignore = False
                 allowed_users = ignore_settings.get("allowed_users", [])
 
+                # Get off-diff comment mode (CLI override > config > default)
+                off_diff_mode = _resolve_off_diff_mode(args, config)
+                comment_tag = _resolve_comment_tag(args, config)
+
                 # In streaming mode, don't cleanup comments (we want to keep earlier files)
                 # Cleanup will happen once at the end
                 commenter = PRCommenter(
@@ -575,17 +662,25 @@ Examples:
                     fail_on_severities=fail_on_severities,
                     enable_codeowners_ignore=enable_ignore,
                     allowed_ignore_users=allowed_users,
+                    off_diff_comment_mode=off_diff_mode,
+                    comment_tag=comment_tag,
                 )
 
                 # Create a mini-report for just this file
                 generator = ReportGenerator()
                 mini_report = generator.generate_report([result])
 
-                # Post line-specific comments (skip cleanup - runs at end of streaming)
+                # Post line-specific comments (skip cleanup - runs at end of streaming).
+                # Labels must NOT be managed per-file: each mini-report only sees
+                # one file's severities, so a file with no findings would
+                # incorrectly remove labels that another file just added.
+                # Label management happens once in _run_final_review_cleanup
+                # against the full aggregated report.
                 await commenter.post_findings_to_pr(
                     mini_report,
                     create_review=True,
                     add_summary_comment=False,  # Summary comes later
+                    manage_labels=False,
                 )
         except Exception as e:
             logging.warning(f"Failed to post review for {result.policy_file}: {e}")
@@ -658,6 +753,7 @@ Examples:
                 config_path = getattr(args, "config", None)
                 config = ConfigLoader.load_config(config_path)
                 fail_on_severities = config.get_setting("fail_on_severity", ["error", "critical"])
+                severity_labels = config.get_setting("severity_labels", {})
 
                 # Get ignore settings
                 ignore_settings = config.get_setting("ignore_settings", {})
@@ -666,13 +762,20 @@ Examples:
                     enable_ignore = False
                 allowed_users = ignore_settings.get("allowed_users", [])
 
+                # Get off-diff comment mode (CLI override > config > default)
+                off_diff_mode = _resolve_off_diff_mode(args, config)
+                comment_tag = _resolve_comment_tag(args, config)
+
                 # Create commenter WITH cleanup enabled for the final pass
                 commenter = PRCommenter(
                     github,
                     cleanup_old_comments=True,  # Enable cleanup for final pass
                     fail_on_severities=fail_on_severities,
+                    severity_labels=severity_labels,
                     enable_codeowners_ignore=enable_ignore,
                     allowed_ignore_users=allowed_users,
+                    off_diff_comment_mode=off_diff_mode,
+                    comment_tag=comment_tag,
                 )
 
                 # Create a full report with all results
@@ -680,13 +783,16 @@ Examples:
                 full_report = generator.generate_report(all_results)
 
                 # Post with create_review=True to run the full update/create/delete logic
-                # but pass all_validated_files so cleanup knows the full scope
+                # but pass all_validated_files so cleanup knows the full scope.
+                # Labels are managed here (once, against the aggregated report)
+                # so they correctly reflect the full set of findings rather
+                # than any single file's mini-report.
                 logging.info("Running final comment cleanup...")
                 await commenter.post_findings_to_pr(
                     full_report,
                     create_review=True,
                     add_summary_comment=False,
-                    manage_labels=False,  # Labels are managed separately
+                    manage_labels=bool(severity_labels),
                     process_ignores=False,  # Already processed per-file
                 )
 
@@ -715,24 +821,29 @@ Examples:
             summary_parts = []
 
             # Header with status
+            policies_with_errors = report.policies_with_errors
             if report.total_issues == 0:
                 summary_parts.append("# ✅ IAM Policy Validation - Passed")
-            elif report.invalid_policies > 0:
-                summary_parts.append("# ❌ IAM Policy Validation - Failed")
+            elif policies_with_errors > 0:
+                summary_parts.append("# ❌ IAM Policy Validation - Failed (AWS-invalid policies)")
             else:
-                summary_parts.append("# ⚠️ IAM Policy Validation - Security Issues Found")
+                summary_parts.append("# ⚠️ IAM Policy Validation - Findings Reported")
 
             summary_parts.append("")
 
             # Summary table
             summary_parts.append("## Summary")
             summary_parts.append("")
+            summary_parts.append(
+                "> _**Invalid** = structurally broken (AWS would reject)._ "
+                "_**Findings** = security or best-practice issues on a valid policy._"
+            )
+            summary_parts.append("")
             summary_parts.append("| Metric | Count |")
             summary_parts.append("|--------|-------|")
             summary_parts.append(f"| Total Policies | {report.total_policies} |")
-            summary_parts.append(f"| Valid Policies | {report.valid_policies} |")
-            summary_parts.append(f"| Invalid Policies | {report.invalid_policies} |")
-            summary_parts.append(f"| Policies with Security Issues | {report.policies_with_security_issues} |")
+            summary_parts.append(f"| Policies with Errors (AWS-invalid) | {policies_with_errors} |")
+            summary_parts.append(f"| Policies with Findings | {report.policies_with_findings} |")
             summary_parts.append(f"| **Total Issues** | **{report.total_issues}** |")
 
             # Issue breakdown by severity if there are issues
@@ -811,6 +922,6 @@ Examples:
             logging.warning(f"Failed to generate enhanced output: {e}")
             print("\nValidation Summary:")
             print(f"  Total policies: {report.total_policies}")
-            print(f"  Valid: {report.valid_policies}")
-            print(f"  Invalid: {report.invalid_policies}")
+            print(f"  With errors (AWS-invalid): {report.policies_with_errors}")
+            print(f"  With findings: {report.policies_with_findings}")
             print(f"  Total issues: {report.total_issues}\n")

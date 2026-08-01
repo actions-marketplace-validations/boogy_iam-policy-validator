@@ -6,7 +6,7 @@ IAM policies, and validation results.
 
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from iam_validator.core import constants
 
@@ -142,6 +142,16 @@ class Statement(BaseModel):
             return []
         return [self.not_resource] if isinstance(self.not_resource, str) else self.not_resource
 
+    def is_full_wildcard_allow(self) -> bool:
+        """True if this statement grants Allow */* (conditions do not prevent suppression)."""
+        if self.effect != "Allow":
+            return False
+        if self.not_action or self.not_resource:
+            return False
+        actions = self.get_actions()
+        resources = self.get_resources()
+        return bool(actions) and bool(resources) and set(actions) == {"*"} and set(resources) == {"*"}
+
 
 class IAMPolicy(BaseModel):
     """IAM policy document."""
@@ -162,14 +172,16 @@ class ValidationIssue(BaseModel):
       (for issues that make the policy invalid according to AWS IAM rules)
     - Security: "critical", "high", "medium", "low"
       (for security best practices and configuration issues)
+    - Special: "none"
+      (issue is suppressed — never shown in any output)
     """
 
-    severity: str  # "error", "warning", "info" OR "critical", "high", "medium", "low"
+    severity: str  # "error", "warning", "info" OR "critical", "high", "medium", "low" OR "none"
 
     @field_validator("severity")
     @classmethod
     def validate_severity(cls, v: str) -> str:
-        valid = {"error", "warning", "info", "critical", "high", "medium", "low"}
+        valid = {"error", "warning", "info", "critical", "high", "medium", "low", "none"}
         if v not in valid:
             raise ValueError(f"Invalid severity '{v}'. Must be one of: {', '.join(sorted(valid))}")
         return v
@@ -209,6 +221,7 @@ class ValidationIssue(BaseModel):
             "high",
             "medium",
             "low",  # Security severities
+            "none",  # Suppressed — filtered out before output
         ]
     )
 
@@ -235,12 +248,25 @@ class ValidationIssue(BaseModel):
         """Check if this issue uses IAM validity severity levels (error/warning/info)."""
         return self.severity in {"error", "warning", "info"}
 
-    def to_pr_comment(self, include_identifier: bool = True, file_path: str = "") -> str:
+    def to_pr_comment(
+        self,
+        include_identifier: bool = True,
+        file_path: str = "",
+        review_identifier: str | None = None,
+    ) -> str:
         """Format issue as a PR comment.
 
         Args:
             include_identifier: Whether to include bot identifier (for cleanup)
             file_path: Relative path to the policy file (for finding ID)
+            review_identifier: HTML marker embedded at the top of the body so
+                the GitHub integration's ``identifier in body`` lookups can
+                find this comment again on subsequent runs. Defaults to the
+                un-scoped :data:`iam_validator.core.constants.REVIEW_IDENTIFIER`.
+                Pass ``PRCommenter.REVIEW_IDENTIFIER`` (which carries the
+                optional ``comment_tag`` scope) so producer and consumer
+                stay in lockstep when the validator runs in parallel for
+                multiple policy types on the same PR.
 
         Returns:
             Formatted comment string
@@ -261,14 +287,22 @@ class ValidationIssue(BaseModel):
                 category_display = self.risk_category.replace("_", " ").title()
                 risk_icon = f" | {icon} {category_display}"
 
+        # Policy-derived fields (Sid, action, resource, messages that embed
+        # them, …) are attacker-controlled in a PR context. Sanitize at the
+        # render boundary so crafted values cannot forge the bot's HTML
+        # markers or break out of the surrounding markdown. The finding
+        # fingerprint above is computed from the RAW values — never sanitize
+        # hash inputs or finding IDs drift across releases.
+        sanitize = constants.sanitize_untrusted_comment_text
+
         parts = []
 
         # Add identifier for bot comment cleanup (HTML comment - not visible to users)
         if include_identifier:
-            parts.append(f"{constants.REVIEW_IDENTIFIER}\n")
+            parts.append(f"{review_identifier or constants.REVIEW_IDENTIFIER}\n")
             parts.append(f"{constants.BOT_IDENTIFIER}\n")
             # Add issue type identifier to allow multiple issues at same line
-            parts.append(f"<!-- issue-type: {self.issue_type} -->\n")
+            parts.append(constants.ISSUE_TYPE_MARKER_FORMAT.format(issue_type=self.issue_type) + "\n")
             # Add finding ID for ignore tracking
             if file_path:
                 from iam_validator.core.finding_fingerprint import compute_finding_hash
@@ -283,7 +317,7 @@ class ValidationIssue(BaseModel):
                     resource=self.resource,
                     condition_key=self.condition_key,
                 )
-                parts.append(f"<!-- finding-id: {finding_hash} -->\n")
+                parts.append(constants.FINDING_ID_MARKER_FORMAT.format(finding_id=finding_hash) + "\n")
 
         # Main issue header with severity, action guidance, and risk category
         parts.append(f"{emoji} **{self.severity.upper()}** - {action}{risk_icon}")
@@ -292,7 +326,8 @@ class ValidationIssue(BaseModel):
         # Build statement context for better navigation
         statement_context = f"Statement[{self.statement_index}]"
         if self.statement_sid:
-            statement_context = f"`{self.statement_sid}` ({statement_context})"
+            safe_sid = sanitize(self.statement_sid, neutralize_backticks=True)
+            statement_context = f"`{safe_sid}` ({statement_context})"
         if self.line_number:
             statement_context = f"{statement_context} (line {self.line_number})"
 
@@ -301,12 +336,12 @@ class ValidationIssue(BaseModel):
         parts.append("")
 
         # Show message immediately (not collapsed)
-        parts.append(self.message)
+        parts.append(sanitize(self.message))
 
         # Add risk explanation if present (shown prominently)
         if self.risk_explanation:
             parts.append("")
-            parts.append(f"> **Why this matters:** {self.risk_explanation}")
+            parts.append(f"> **Why this matters:** {sanitize(self.risk_explanation)}")
 
         # Put additional details in collapsible section if there are any
         has_details = bool(
@@ -329,32 +364,32 @@ class ValidationIssue(BaseModel):
             if self.action or self.resource or self.condition_key:
                 parts.append("**Affected Fields:**")
                 if self.action:
-                    parts.append(f"  - Action: `{self.action}`")
+                    parts.append(f"  - Action: `{sanitize(self.action, neutralize_backticks=True)}`")
                 if self.resource:
-                    parts.append(f"  - Resource: `{self.resource}`")
+                    parts.append(f"  - Resource: `{sanitize(self.resource, neutralize_backticks=True)}`")
                 if self.condition_key:
-                    parts.append(f"  - Condition Key: `{self.condition_key}`")
+                    parts.append(f"  - Condition Key: `{sanitize(self.condition_key, neutralize_backticks=True)}`")
                 parts.append("")
 
             # Add remediation steps if present
             if self.remediation_steps:
                 parts.append("**🔧 How to Fix:**")
                 for i, step in enumerate(self.remediation_steps, 1):
-                    parts.append(f"  {i}. {step}")
+                    parts.append(f"  {i}. {sanitize(step)}")
                 parts.append("")
 
             # Add suggestion if present
             if self.suggestion:
                 parts.append("**💡 Suggested Fix:**")
                 parts.append("")
-                parts.append(self.suggestion)
+                parts.append(sanitize(self.suggestion))
                 parts.append("")
 
             # Add example if present (formatted as JSON code block for GitHub)
             if self.example:
                 parts.append("**Example:**")
                 parts.append("```json")
-                parts.append(self.example)
+                parts.append(sanitize(self.example, neutralize_fences=True))
                 parts.append("```")
 
             parts.append("")
@@ -392,27 +427,67 @@ class ValidationReport(BaseModel):
 
     total_policies: int
     valid_policies: int
-    invalid_policies: int  # Policies with IAM validity issues (error/warning)
-    policies_with_security_issues: int = 0  # Policies with security findings (critical/high/medium/low)
+    invalid_policies: int  # Policies failing validation per fail_on_severities config
+    # Policies with security-categorized findings only (critical/high/medium/low).
+    # Excludes warning/info. Retained for backward compatibility with existing JSON
+    # consumers; new code should prefer `policies_with_findings`, which covers all
+    # non-error severities including warning/info.
+    policies_with_security_issues: int = 0
     total_issues: int
     validity_issues: int = 0  # Count of IAM validity issues (error/warning/info)
     security_issues: int = 0  # Count of security issues (critical/high/medium/low)
     results: list[PolicyValidationResult] = Field(default_factory=list)
     parsing_errors: list[tuple[str, str]] = Field(default_factory=list)  # (file_path, error_message)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def policies_with_errors(self) -> int:
+        """Count of policies that are structurally invalid (AWS would reject).
+
+        A policy is AWS-invalid when it has at least one issue with severity
+        `error` (malformed structure, nonexistent action, invalid condition key,
+        etc.). Distinct from `invalid_policies`, which is gated by the
+        configurable `fail_on_severities` and so may also include policies that
+        only have security findings.
+        """
+        return sum(1 for r in self.results if any(i.severity == "error" for i in r.issues))
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def policies_with_findings(self) -> int:
+        """Count of policies that have at least one non-error finding.
+
+        A finding is any issue with severity other than `error` — i.e.,
+        `warning`, `info`, `critical`, `high`, `medium`, or `low`. Policies
+        whose only issues are structural errors are NOT counted here; those
+        are reported by `policies_with_errors`. A policy that has both
+        error- and finding-severity issues is counted in both properties.
+        """
+        return sum(1 for r in self.results if any(i.severity != "error" for i in r.issues))
+
     def get_summary(self) -> str:
         """Generate a human-readable summary."""
         parts = []
         parts.append(f"Validated {self.total_policies} policies:")
 
-        # Always show valid/invalid counts
-        parts.append(f"{self.valid_policies} valid")
+        policies_with_errors = self.policies_with_errors
+        policies_with_findings = self.policies_with_findings
 
-        if self.invalid_policies > 0:
-            parts.append(f"{self.invalid_policies} invalid (IAM validity)")
-
-        if self.policies_with_security_issues > 0:
-            parts.append(f"{self.policies_with_security_issues} with security findings")
+        if self.results:
+            clean_policies = sum(1 for r in self.results if not r.issues)
+            parts.append(f"{clean_policies} clean")
+            if policies_with_errors > 0:
+                parts.append(f"{policies_with_errors} with errors (AWS-invalid)")
+            if policies_with_findings > 0:
+                parts.append(f"{policies_with_findings} with findings")
+        else:
+            # Legacy callers may construct a report without attaching results
+            # (only the scalar counters). Use invalid_policies as the error
+            # count so we don't mis-report a failing run as fully clean.
+            clean_policies = max(0, self.total_policies - self.invalid_policies)
+            parts.append(f"{clean_policies} clean")
+            if self.invalid_policies > 0:
+                parts.append(f"{self.invalid_policies} with errors (AWS-invalid)")
 
         parts.append(f"{self.total_issues} total issues")
 

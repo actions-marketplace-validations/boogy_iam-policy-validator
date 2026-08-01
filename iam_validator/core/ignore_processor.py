@@ -11,6 +11,7 @@ import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from iam_validator.core import constants
 from iam_validator.core.codeowners import CodeOwnersParser
 from iam_validator.core.ignored_findings import IgnoredFinding, IgnoredFindingsStore
 
@@ -43,6 +44,7 @@ class IgnoreCommandProcessor:
         github: GitHubIntegration,
         allowed_users: list[str] | None = None,
         post_denial_feedback: bool = False,
+        comment_tag: str | None = None,
     ) -> None:
         """Initialize the processor.
 
@@ -51,11 +53,14 @@ class IgnoreCommandProcessor:
             allowed_users: Fallback list of users who can ignore findings
                           (used when CODEOWNERS is not available)
             post_denial_feedback: Whether to post visible replies on denied ignores
+            comment_tag: Optional run scope; forwarded to
+                :class:`IgnoredFindingsStore` so each tagged run maintains
+                its own ignore store instead of trampling sibling runs.
         """
         self.github = github
         self.allowed_users = allowed_users or []
         self.post_denial_feedback = post_denial_feedback
-        self.store = IgnoredFindingsStore(github)
+        self.store = IgnoredFindingsStore(github, comment_tag=comment_tag)
         self._codeowners_parser: CodeOwnersParser | None = None
         self._codeowners_loaded = False
         # Cache for authorization results: (username, file_path) -> bool
@@ -263,13 +268,14 @@ class IgnoreCommandProcessor:
         Returns:
             Issue type or empty string
         """
-        match = re.search(r"<!-- issue-type: (\w+) -->", body)
+        match = re.search(constants.ISSUE_TYPE_MARKER_PATTERN, body)
         return match.group(1) if match else ""
 
 
 async def filter_ignored_findings(
     github: GitHubIntegration,
     findings: list[tuple[str, Any]],  # List of (file_path, ValidationIssue)
+    comment_tag: str | None = None,
 ) -> tuple[list[tuple[str, Any]], frozenset[str]]:
     """Filter out ignored findings from a list.
 
@@ -279,13 +285,17 @@ async def filter_ignored_findings(
     Args:
         github: GitHub integration instance
         findings: List of (file_path, issue) tuples
+        comment_tag: Optional run scope; forwarded to
+            :class:`IgnoredFindingsStore` so callers running in a tagged
+            scope read the tag-specific ignore store rather than the
+            un-scoped legacy store.
 
     Returns:
         Tuple of (filtered_findings, ignored_ids)
     """
     from iam_validator.core.finding_fingerprint import FindingFingerprint
 
-    store = IgnoredFindingsStore(github)
+    store = IgnoredFindingsStore(github, comment_tag=comment_tag)
     ignored_ids = await store.get_ignored_ids()
 
     if not ignored_ids:

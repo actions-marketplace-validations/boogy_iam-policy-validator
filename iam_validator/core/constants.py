@@ -10,21 +10,56 @@ References:
 - AWS ARN Format: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference-arns.html
 """
 
+import re
+
 # ============================================================================
 # ARN Validation
 # ============================================================================
 
 # ARN Validation Pattern
-# This pattern is specifically designed for validation and allows wildcards (*) in region and account fields
-# Unlike the parsing pattern in CompiledPatterns, this is more lenient for validation purposes
-# Supports all AWS partitions: aws, aws-cn, aws-us-gov, aws-eusc, aws-iso*
-DEFAULT_ARN_VALIDATION_PATTERN = (
-    r"^arn:(aws|aws-cn|aws-us-gov|aws-eusc|aws-iso|aws-iso-b|aws-iso-e|aws-iso-f):[a-z0-9\-]+:[a-z0-9\-*]*:[0-9*]*:.+$"
-)
+# Every place that validates an ARN must source the partition alternation from
+# ARN_PARTITION_REGEX so the supported partitions stay in lockstep. Adding a
+# new partition (e.g., a future AWS region split) is then a one-line change.
+# Covers commercial, China, GovCloud, Europe sovereign, and all ISO partitions.
+ARN_PARTITION_REGEX = r"(aws|aws-cn|aws-us-gov|aws-eusc|aws-iso|aws-iso-b|aws-iso-e|aws-iso-f)"
+
+# Lenient ARN format used by `resource_validation` — allows wildcards (*) in
+# region and account fields. Stricter than the structural parser in
+# CompiledPatterns but tolerant enough for policy-author conveniences.
+DEFAULT_ARN_VALIDATION_PATTERN = rf"^arn:{ARN_PARTITION_REGEX}:[a-z0-9\-]+:[a-z0-9\-*]*:[0-9*]*:.+$"
 
 # Maximum allowed ARN length to prevent ReDoS attacks
 # AWS maximum ARN length is approximately 2048 characters
 MAX_ARN_LENGTH = 2048
+
+# ============================================================================
+# IAM Policy Version Literals
+# ============================================================================
+# Centralized so MCP, fix tools, and templates can't drift. AWS recognises two
+# IAM policy language versions: "2012-10-17" (current) and "2008-10-17" (legacy).
+# New policies should always use "2012-10-17".
+IAM_POLICY_VERSION_CURRENT = "2012-10-17"
+IAM_POLICY_VERSION_LEGACY = "2008-10-17"
+IAM_POLICY_VERSIONS_VALID: frozenset[str] = frozenset({IAM_POLICY_VERSION_CURRENT, IAM_POLICY_VERSION_LEGACY})
+
+# ============================================================================
+# Default region per AWS partition
+# ============================================================================
+# AWS service endpoints are partition-specific. `us-east-1` is only valid in
+# the commercial partition. Any tool calling boto3 with a partition other than
+# `aws` MUST use a region that exists in that partition or the SDK rejects the
+# request before it leaves the box. Centralized so MCP, CLI, and tests
+# converge on the same defaults.
+PARTITION_DEFAULT_REGION: dict[str, str] = {
+    "aws": "us-east-1",
+    "aws-cn": "cn-north-1",
+    "aws-us-gov": "us-gov-west-1",
+    "aws-eusc": "eusc-de-east-1",
+    "aws-iso": "us-iso-east-1",
+    "aws-iso-b": "us-isob-east-1",
+    "aws-iso-e": "eu-isoe-west-1",
+    "aws-iso-f": "us-isof-south-1",
+}
 
 # ============================================================================
 # AWS IAM Policy Size Limits
@@ -32,17 +67,39 @@ MAX_ARN_LENGTH = 2048
 # These limits are enforced by AWS and policies exceeding them will be rejected
 # Note: AWS does not count whitespace when calculating policy size
 
-# Managed policy maximum size (characters, excluding whitespace)
+# Managed policy maximum size (bytes, excluding whitespace)
 MAX_MANAGED_POLICY_SIZE = 6144
 
-# Inline policy maximum size for IAM users (characters, excluding whitespace)
+# Inline policy maximum size for IAM users (bytes, excluding whitespace)
 MAX_INLINE_USER_POLICY_SIZE = 2048
 
-# Inline policy maximum size for IAM groups (characters, excluding whitespace)
+# Inline policy maximum size for IAM groups (bytes, excluding whitespace)
 MAX_INLINE_GROUP_POLICY_SIZE = 5120
 
-# Inline policy maximum size for IAM roles (characters, excluding whitespace)
+# Inline policy maximum size for IAM roles (bytes, excluding whitespace)
 MAX_INLINE_ROLE_POLICY_SIZE = 10240
+
+# Inline policy maximum size for IAM role trust policies (bytes, excluding whitespace).
+# Trust policies are the assume-role policies attached to IAM roles.
+MAX_INLINE_ROLE_TRUST_POLICY_SIZE = 2048
+
+# Service Control Policy maximum size (bytes, excluding whitespace)
+MAX_SCP_SIZE = 5120
+
+# Resource Control Policy maximum size (bytes, excluding whitespace)
+MAX_RCP_SIZE = 5120
+
+# Default maximum policy file size accepted by PolicyLoader, in MB.
+# A real IAM policy tops out at ~10 KB (see the byte limits above), so 10 MB
+# is ~1000x headroom while preventing memory exhaustion from huge files.
+# Override per-loader via PolicyLoader(max_file_size_mb=...).
+DEFAULT_MAX_POLICY_FILE_SIZE_MB = 10
+
+# Maximum bracket/brace nesting depth accepted when parsing policy JSON.
+# Real policies nest a handful of levels; pathological nesting causes
+# RecursionError deep inside the parser (which used to silently skip the
+# file). 100 is far beyond any legitimate policy.
+MAX_JSON_NESTING_DEPTH = 100
 
 # Policy size limits dictionary (for backward compatibility and easy lookup)
 AWS_POLICY_SIZE_LIMITS = {
@@ -50,6 +107,22 @@ AWS_POLICY_SIZE_LIMITS = {
     "inline_user": MAX_INLINE_USER_POLICY_SIZE,
     "inline_group": MAX_INLINE_GROUP_POLICY_SIZE,
     "inline_role": MAX_INLINE_ROLE_POLICY_SIZE,
+    "inline_role_trust": MAX_INLINE_ROLE_TRUST_POLICY_SIZE,
+    "scp": MAX_SCP_SIZE,
+    "rcp": MAX_RCP_SIZE,
+}
+
+# Default mapping from runtime policy type (the `--policy-type` argument or
+# auto-detected type) to the size-limit key in AWS_POLICY_SIZE_LIMITS.
+# Users can override the chosen limit on a per-check basis by setting
+# `checks.policy_size.config.policy_type` in their YAML config (e.g. to use
+# `inline_user` instead of `managed` for an IDENTITY_POLICY).
+AWS_POLICY_TYPE_TO_SIZE_KEY = {
+    "IDENTITY_POLICY": "managed",
+    "RESOURCE_POLICY": "managed",  # conservative default; service-specific limits vary
+    "TRUST_POLICY": "inline_role_trust",
+    "SERVICE_CONTROL_POLICY": "scp",
+    "RESOURCE_CONTROL_POLICY": "rcp",
 }
 
 # ============================================================================
@@ -101,10 +174,173 @@ BOT_IDENTIFIER = "🤖 IAM Policy Validator"
 SUMMARY_IDENTIFIER = "<!-- iam-policy-validator-summary -->"
 REVIEW_IDENTIFIER = "<!-- iam-policy-validator-review -->"
 IGNORED_FINDINGS_IDENTIFIER = "<!-- iam-policy-validator-ignored-findings -->"
+ANALYZER_IDENTIFIER = "<!-- iam-access-analyzer-validator -->"
+
+# Tag scoping for the markers above. When the user runs the validator
+# multiple times against the same PR (e.g. one run per policy type),
+# every run must address its own canonical comment instead of overwriting
+# the others. `scoped_marker(base, tag)` rewrites the marker to embed
+# the tag, e.g. `<!-- iam-policy-validator-summary:role -->`. With no
+# tag the marker is unchanged, preserving the existing comment lifecycle
+# and matching legacy comments stored before the tagging feature shipped.
+#
+# Tag charset is intentionally narrow so it is safe to splice into an
+# HTML comment, into the `body in identifier` substring matching used by
+# `_sync_comments_with_identifier`, and into shell command lines coming
+# from the GitHub Action's `comment-tag` input.
+COMMENT_TAG_PATTERN = r"^[A-Za-z0-9._-]{1,32}$"
+# Pre-compiled once at module load — `scoped_marker` is hot-pathed during
+# every PRCommenter / IgnoredFindingsStore construction, and the config
+# loader's `validate_comment_tag` reuses the same regex.
+_COMMENT_TAG_RE = re.compile(COMMENT_TAG_PATTERN)
+
+
+def scoped_marker(base: str, tag: str | None) -> str:
+    """Return ``base`` with ``tag`` spliced before the closing ``-->``.
+
+    With ``tag`` ``None`` or empty the base marker is returned unchanged
+    so existing PR comments and tests keep working without modification.
+
+    Args:
+        base: One of the module-level identifier constants
+            (``SUMMARY_IDENTIFIER``, ``REVIEW_IDENTIFIER``,
+            ``IGNORED_FINDINGS_IDENTIFIER``, ``ANALYZER_IDENTIFIER``)
+            or any string ending in ``-->``.
+        tag: Optional run scope. Must match :data:`COMMENT_TAG_PATTERN`
+            (letters, digits, ``.``, ``_``, ``-``; 1-32 chars).
+            ``None`` and ``""`` are accepted and result in the base
+            marker being returned unchanged.
+
+    Returns:
+        The scoped marker, e.g.
+        ``"<!-- iam-policy-validator-summary:role -->"``.
+
+    Raises:
+        ValueError: When ``tag`` is non-empty but does not match
+            :data:`COMMENT_TAG_PATTERN`.
+    """
+    if not tag:
+        return base
+    if not _COMMENT_TAG_RE.fullmatch(tag):
+        raise ValueError(
+            f"Invalid comment tag: {tag!r}. Must match {COMMENT_TAG_PATTERN} "
+            "(letters, digits, '.', '_', '-', 1-32 chars)."
+        )
+    if not base.endswith(" -->"):
+        # Defensive: every identifier in this module ends with " -->",
+        # but stay correct if a caller passes a hand-rolled marker.
+        return f"{base}:{tag}"
+    return f"{base[:-4]}:{tag} -->"
+
+
+# Structural markers embedded inside review-comment bodies. Centralized so
+# producers (body-builders in models.py) and consumers (parsers in
+# github_integration.py / ignore_processor.py) cannot drift apart.
+ISSUE_TYPE_MARKER_FORMAT = "<!-- issue-type: {issue_type} -->"
+ISSUE_TYPE_MARKER_PATTERN = r"<!-- issue-type: (\w+) -->"
+FINDING_ID_MARKER_FORMAT = "<!-- finding-id: {finding_id} -->"
+# Strict pattern: the canonical 16-char hex hash produced by
+# compute_finding_hash(). Used by the bot's own comment lifecycle.
+FINDING_ID_STRICT_PATTERN = r"<!-- finding-id: ([a-f0-9]{16}) -->"
+# Loose pattern: accepts any hex length. Used by extract_finding_id() when
+# parsing user-authored ignore commands that may reference legacy ids.
+FINDING_ID_LOOSE_PATTERN = r"<!-- finding-id: ([a-f0-9]+) -->"
+
+# Zero-width space used to defang untrusted text without changing how it
+# renders: inserting it inside an HTML-comment delimiter or tag name stops
+# GitHub from parsing the construct while the visible characters stay intact.
+ZERO_WIDTH_SPACE = "\u200b"
+
+# How many leading lines of a comment body may carry bot markers. Every
+# body the bot emits (summary, multipart, review, ignored-findings store)
+# places its identifying markers at the start of one of the first few
+# lines; scanning only this window keeps forged markers buried later in a
+# body from matching.
+MARKER_SCAN_LINES = 10
+
+
+def sanitize_untrusted_comment_text(
+    text: str,
+    *,
+    neutralize_backticks: bool = False,
+    neutralize_fences: bool = False,
+) -> str:
+    """Neutralize marker/markdown breakouts in attacker-controlled text.
+
+    Policy fields (``Sid``, ``Action``, ``Resource``, messages that embed
+    them, …) flow into the bot's PR comments. Without sanitization a
+    crafted value can inject the bot's own HTML markers (breaking comment
+    dedup/update/delete) or break out of the surrounding markdown
+    structure. This helper defangs those constructs in a bounded way — a
+    zero-width space is inserted so the text still *reads* the same but no
+    longer *parses* as an HTML comment or tag.
+
+    Args:
+        text: Untrusted text destined for a PR comment body.
+        neutralize_backticks: Set when the value is interpolated inside a
+            markdown inline code span (`` `...` ``). Backticks are replaced
+            with apostrophes so the value cannot close the span.
+        neutralize_fences: Set when the value is interpolated inside a
+            fenced code block. Triple-backtick runs are broken up so the
+            value cannot close the fence.
+
+    Returns:
+        The sanitized text. Text without any of the neutralized tokens is
+        returned unchanged (byte-identical).
+    """
+    if not text:
+        return text
+    sanitized = text
+    if "<!--" in sanitized:
+        sanitized = sanitized.replace("<!--", f"<!{ZERO_WIDTH_SPACE}--")
+    if "-->" in sanitized:
+        sanitized = sanitized.replace("-->", f"--{ZERO_WIDTH_SPACE}>")
+    # <details>/<summary> open/close tags could truncate or extend the
+    # collapsible section the renderer wraps details in.
+    sanitized = re.sub(
+        r"<(/?)(details|summary)",
+        rf"<{ZERO_WIDTH_SPACE}\1\2",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    if neutralize_fences and "```" in sanitized:
+        sanitized = sanitized.replace("```", f"``{ZERO_WIDTH_SPACE}`")
+    if neutralize_backticks and "`" in sanitized:
+        sanitized = sanitized.replace("`", "'")
+    return sanitized
+
+
+def body_has_anchored_marker(body: str, identifier: str) -> bool:
+    """Check whether ``body`` carries ``identifier`` where the bot puts it.
+
+    The bot always emits its identifying markers at the start of one of
+    the first :data:`MARKER_SCAN_LINES` lines of a comment body. Requiring
+    the marker there (instead of a bare ``identifier in body`` substring
+    test) prevents comments that merely quote — or maliciously embed — a
+    marker deeper in their body from being treated as bot comments.
+
+    Args:
+        body: Full comment body as returned by the GitHub API.
+        identifier: One of the marker constants (optionally scoped via
+            :func:`scoped_marker`) or :data:`BOT_IDENTIFIER`.
+
+    Returns:
+        True when the identifier is anchored at a line start within the
+        scan window.
+    """
+    if not body or not identifier:
+        return False
+    for line in body.splitlines()[:MARKER_SCAN_LINES]:
+        if line.startswith(identifier):
+            return True
+    return False
+
 
 # GitHub comment size limits
-# GitHub's actual limit is 65536 characters, but we use a smaller limit for safety
-GITHUB_MAX_COMMENT_LENGTH = 65000  # Maximum single comment length
+# GITHUB_COMMENT_HARD_LIMIT is GitHub's actual API ceiling — exceeding it
+# returns a 422. The other two limits are our internal safety margins.
+GITHUB_COMMENT_HARD_LIMIT = 65536  # GitHub-enforced absolute maximum
+GITHUB_MAX_COMMENT_LENGTH = 65000  # Maximum single comment length (safety margin)
 GITHUB_COMMENT_SPLIT_LIMIT = 60000  # Target size when splitting into multiple parts
 
 # Comment size estimation parameters (used for multi-part comment splitting)
@@ -141,16 +377,70 @@ SECONDS_PER_HOUR = 3600
 # Policy Type Restrictions
 # ============================================================================
 
-# AWS services that support Resource Control Policies (RCP)
-# These services can have wildcard actions in RCP policy statements
+# AWS services that support Resource Control Policies (RCP).
+# Sourced from the official AWS Organizations documentation (verified
+# 2026-07-20). Expanded well beyond the 2024 launch set (s3, sts, kms, sqs,
+# secretsmanager); the current IAM service prefixes are:
+#
+#   - Amazon S3 (s3)
+#   - AWS Security Token Service (sts)
+#   - Amazon SQS (sqs)
+#   - AWS Key Management Service (kms) — note: RCPs do NOT apply to
+#     `kms:RetireGrant` or to AWS-managed keys
+#   - AWS Secrets Manager (secretsmanager)
+#   - Amazon Cognito: User Pools (cognito-idp) and Identity Pools (cognito-identity)
+#   - Amazon DynamoDB (dynamodb)
+#   - DynamoDB Accelerator (dax)
+#   - Amazon Elastic Container Registry (ecr)
+#   - Amazon OpenSearch Serverless (aoss) — note: this is the serverless
+#     product, not Amazon OpenSearch Service (`es`), which is NOT covered
+#   - Amazon CloudWatch Logs (logs)
+#   - AWS AppConfig (appconfig)
+#   - Amazon AppStream (appstream)
+#   - Amazon EC2 Auto Scaling (autoscaling)
+#   - AWS CodeBuild (codebuild)
+#   - AWS CodeCommit (codecommit)
+#   - Amazon Comprehend (comprehend)
+#   - Amazon Comprehend Medical (comprehendmedical)
+#   - AWS Health (health)
+#   - Amazon Kinesis Video Streams (kinesisvideo)
+#   - AWS Sign-In (signin)
+#   - AWS Support (support)
+#   - Amazon Textract (textract)
+#   - Amazon Transcribe (transcribe)
+#   - Amazon Translate (translate)
+#
+# New AWS launches can be accepted without a validator release via the
+# `additional_rcp_services` config option of the `policy_type_validation` check.
 # Reference: https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html
 RCP_SUPPORTED_SERVICES = frozenset(
     {
-        "s3",
-        "sts",
-        "sqs",
-        "secretsmanager",
+        "aoss",
+        "appconfig",
+        "appstream",
+        "autoscaling",
+        "codebuild",
+        "codecommit",
+        "cognito-identity",
+        "cognito-idp",
+        "comprehend",
+        "comprehendmedical",
+        "dax",
+        "dynamodb",
+        "ecr",
+        "health",
+        "kinesisvideo",
         "kms",
+        "logs",
+        "s3",
+        "secretsmanager",
+        "signin",
+        "sqs",
+        "sts",
+        "support",
+        "textract",
+        "transcribe",
+        "translate",
     }
 )
 

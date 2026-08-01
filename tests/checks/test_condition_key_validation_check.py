@@ -24,6 +24,10 @@ class TestConditionKeyValidationCheck:
     def fetcher(self):
         mock = MagicMock(spec=AWSServiceFetcher)
         mock.validate_condition_key = AsyncMock()
+        # Default: all actions exist. Override in specific tests for non-existent actions.
+        mock.validate_actions_batch = AsyncMock(
+            side_effect=lambda actions, **_: {a: (True, None, False) for a in actions}
+        )
         return mock
 
     @pytest.fixture
@@ -97,6 +101,44 @@ class TestConditionKeyValidationCheck:
         )
         issues = await check.execute(statement, 0, fetcher, config)
         assert len(issues) == 1
+
+    @pytest.mark.asyncio
+    async def test_skips_nonexistent_actions(self, check, fetcher, config):
+        """Non-existent actions are skipped — `action_validation` handles those."""
+        fetcher.validate_actions_batch = AsyncMock(
+            return_value={"apigateway:TagResource": (False, "Action not found", False)}
+        )
+        statement = Statement(
+            Sid="APIGatewayModify",
+            Effect="Allow",
+            Action=["apigateway:TagResource"],
+            Resource=["arn:aws:apigateway:*::/tags/*"],
+            Condition={"StringEquals": {"aws:ResourceTag/owner": "alice"}},
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+        assert len(issues) == 0
+        fetcher.validate_condition_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mix_of_existing_and_nonexistent_actions(self, check, fetcher, config):
+        """Only real actions are validated; fake ones are silently skipped here."""
+        fetcher.validate_actions_batch = AsyncMock(
+            return_value={
+                "s3:GetObject": (True, None, False),
+                "s3:FakeAction": (False, "Action not found", False),
+            }
+        )
+        fetcher.validate_condition_key.return_value = ConditionKeyValidationResult(is_valid=True)
+        statement = Statement(
+            Effect="Allow",
+            Action=["s3:GetObject", "s3:FakeAction"],
+            Resource=["arn:aws:s3:::bucket/*"],
+            Condition={"StringEquals": {"s3:prefix": "documents/"}},
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+        assert len(issues) == 0
+        fetcher.validate_condition_key.assert_awaited_once()
+        assert fetcher.validate_condition_key.await_args.args[0] == "s3:GetObject"
 
     @pytest.mark.asyncio
     async def test_global_condition_key_with_warning(self, check, fetcher, config):
@@ -284,6 +326,10 @@ class TestIfExistsFalsePositiveSuppression:
     def fetcher(self):
         mock = MagicMock(spec=AWSServiceFetcher)
         mock.validate_condition_key = AsyncMock()
+        # Default: all actions exist. Override in specific tests for non-existent actions.
+        mock.validate_actions_batch = AsyncMock(
+            side_effect=lambda actions, **_: {a: (True, None, False) for a in actions}
+        )
         return mock
 
     @pytest.fixture
@@ -384,3 +430,262 @@ class TestIfExistsFalsePositiveSuppression:
         # Should suppress invalid_condition_key but report warning
         assert not any(i.issue_type == "invalid_condition_key" for i in issues)
         assert any(i.issue_type == "global_condition_key_with_action_specific" for i in issues)
+
+
+class TestConditionKeyIssueAggregation:
+    """Test that multiple invalid condition key issues are aggregated into fewer issues."""
+
+    @pytest.fixture
+    def check(self):
+        return ConditionKeyValidationCheck()
+
+    @pytest.fixture
+    def fetcher(self):
+        mock = MagicMock(spec=AWSServiceFetcher)
+        mock.validate_condition_key = AsyncMock()
+        # Default: all actions exist. Override in specific tests for non-existent actions.
+        mock.validate_actions_batch = AsyncMock(
+            side_effect=lambda actions, **_: {a: (True, None, False) for a in actions}
+        )
+        return mock
+
+    @pytest.fixture
+    def config(self):
+        return CheckConfig(check_id="condition_key_validation")
+
+    @pytest.mark.asyncio
+    async def test_aggregates_same_pattern_keys_for_same_action(self, check, fetcher, config):
+        """Multiple RequestTag keys invalid for same action should produce one issue."""
+
+        async def mock_validate(action, key, resources):
+            if key.startswith("aws:RequestTag/"):
+                return ConditionKeyValidationResult(
+                    is_valid=False,
+                    error_message=(
+                        f"Condition key `{key}` is not supported by action `{action}`. "
+                        f"The `aws:RequestTag/${{TagKey}}` condition is only supported by actions "
+                        f"that create or modify resources with tags. This action does not support tag operations."
+                    ),
+                    suggestion="Valid condition keys for this action: `aws:SourceArn`",
+                )
+            return ConditionKeyValidationResult(is_valid=True)
+
+        fetcher.validate_condition_key.side_effect = mock_validate
+
+        statement = Statement(
+            Effect="Allow",
+            Action=["lambda:AddPermission"],
+            Resource=["arn:aws:lambda:*:123456789012:function:my-func"],
+            Condition={
+                "StringEquals": {
+                    "aws:RequestTag/owner": "${aws:PrincipalTag/owner}",
+                    "aws:RequestTag/jira": "${aws:PrincipalTag/jira}",
+                    "aws:RequestTag/env": "${aws:PrincipalTag/env}",
+                }
+            },
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+
+        # Should produce 1 aggregated issue instead of 3
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.issue_type == "invalid_condition_key"
+        assert "aws:RequestTag/owner" in issue.message
+        assert "aws:RequestTag/jira" in issue.message
+        assert "aws:RequestTag/env" in issue.message
+        assert "lambda:AddPermission" in issue.message
+        # Should include the shared explanation
+        assert "tag operations" in issue.message
+
+    @pytest.mark.asyncio
+    async def test_does_not_aggregate_different_patterns(self, check, fetcher, config):
+        """Keys with different base patterns should not be merged."""
+
+        async def mock_validate(action, key, resources):
+            return ConditionKeyValidationResult(
+                is_valid=False,
+                error_message=f"Condition key `{key}` is not valid for action `{action}`",
+            )
+
+        fetcher.validate_condition_key.side_effect = mock_validate
+
+        statement = Statement(
+            Effect="Allow",
+            Action=["s3:GetObject"],
+            Resource=["arn:aws:s3:::bucket/*"],
+            Condition={
+                "StringEquals": {
+                    "aws:RequestTag/owner": "test",
+                    "ec2:InstanceType": "t3.micro",
+                }
+            },
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+
+        # Different patterns → separate issues
+        assert len(issues) == 2
+        condition_keys = {i.condition_key for i in issues}
+        assert "aws:RequestTag/owner" in condition_keys
+        assert "ec2:InstanceType" in condition_keys
+
+    @pytest.mark.asyncio
+    async def test_does_not_aggregate_different_actions(self, check, fetcher, config):
+        """Keys failing for different actions should not be merged."""
+        call_count = 0
+
+        async def mock_validate(action, key, resources):
+            nonlocal call_count
+            call_count += 1
+            # First key invalid for first action, second key invalid for second action
+            if key == "s3:invalidKey1":
+                if action == "s3:GetObject":
+                    return ConditionKeyValidationResult(
+                        is_valid=False,
+                        error_message=f"Condition key `{key}` is not valid for action `{action}`",
+                    )
+                return ConditionKeyValidationResult(is_valid=True)
+            if key == "s3:invalidKey2":
+                if action == "s3:PutObject":
+                    return ConditionKeyValidationResult(
+                        is_valid=False,
+                        error_message=f"Condition key `{key}` is not valid for action `{action}`",
+                    )
+                return ConditionKeyValidationResult(is_valid=True)
+            return ConditionKeyValidationResult(is_valid=True)
+
+        fetcher.validate_condition_key.side_effect = mock_validate
+
+        statement = Statement(
+            Effect="Allow",
+            Action=["s3:GetObject", "s3:PutObject"],
+            Resource=["arn:aws:s3:::bucket/*"],
+            Condition={
+                "StringEquals": {
+                    "s3:invalidKey1": "value1",
+                    "s3:invalidKey2": "value2",
+                }
+            },
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+
+        # Different actions → separate issues (different grouping keys)
+        assert len(issues) == 2
+
+    @pytest.mark.asyncio
+    async def test_single_invalid_key_not_aggregated(self, check, fetcher, config):
+        """Single invalid key should not be affected by aggregation."""
+        fetcher.validate_condition_key.return_value = ConditionKeyValidationResult(
+            is_valid=False,
+            error_message="Condition key `aws:RequestTag/owner` is not supported by action `lambda:AddPermission`",
+        )
+
+        statement = Statement(
+            Effect="Allow",
+            Action=["lambda:AddPermission"],
+            Resource=["arn:aws:lambda:*:123456789012:function:my-func"],
+            Condition={"StringEquals": {"aws:RequestTag/owner": "test"}},
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+
+        assert len(issues) == 1
+        assert issues[0].condition_key == "aws:RequestTag/owner"
+
+    @pytest.mark.asyncio
+    async def test_aggregation_preserves_suggestion(self, check, fetcher, config):
+        """Aggregated issue should include the suggestion from the first issue."""
+
+        async def mock_validate(action, key, resources):
+            return ConditionKeyValidationResult(
+                is_valid=False,
+                error_message=f"Condition key `{key}` is not supported by action `{action}`. Explanation.",
+                suggestion="Use valid condition keys: `aws:SourceArn`, `aws:SourceAccount`",
+            )
+
+        fetcher.validate_condition_key.side_effect = mock_validate
+
+        statement = Statement(
+            Effect="Allow",
+            Action=["lambda:AddPermission"],
+            Resource=["arn:aws:lambda:*:123456789012:function:my-func"],
+            Condition={
+                "StringEquals": {
+                    "aws:RequestTag/owner": "test",
+                    "aws:RequestTag/env": "prod",
+                }
+            },
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+
+        assert len(issues) == 1
+        assert issues[0].suggestion == "Use valid condition keys: `aws:SourceArn`, `aws:SourceAccount`"
+
+    @pytest.mark.asyncio
+    async def test_aggregation_across_operators(self, check, fetcher, config):
+        """Keys from different operators with same base pattern and action should be aggregated."""
+
+        async def mock_validate(action, key, resources):
+            if key.startswith("aws:RequestTag/"):
+                return ConditionKeyValidationResult(
+                    is_valid=False,
+                    error_message=(f"Condition key `{key}` is not supported by action `{action}`. Not supported."),
+                )
+            return ConditionKeyValidationResult(is_valid=True)
+
+        fetcher.validate_condition_key.side_effect = mock_validate
+
+        statement = Statement(
+            Effect="Allow",
+            Action=["lambda:AddPermission"],
+            Resource=["arn:aws:lambda:*:123456789012:function:my-func"],
+            Condition={
+                "StringEquals": {
+                    "aws:RequestTag/owner": "test",
+                },
+                "StringLike": {
+                    "aws:RequestTag/env": "prod*",
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+
+        # Both from different operators but same action+pattern → 1 aggregated issue
+        assert len(issues) == 1
+        assert "aws:RequestTag/owner" in issues[0].message
+        assert "aws:RequestTag/env" in issues[0].message
+
+    @pytest.mark.asyncio
+    async def test_aggregation_keeps_warnings_separate(self, check, fetcher, config):
+        """Warning issues should not be affected by aggregation of errors."""
+
+        async def mock_validate(action, key, resources):
+            if key.startswith("aws:RequestTag/"):
+                return ConditionKeyValidationResult(
+                    is_valid=False,
+                    error_message=f"Condition key `{key}` is not supported by action `{action}`. Reason.",
+                )
+            return ConditionKeyValidationResult(
+                is_valid=True,
+                warning_message="Global condition key warning",
+            )
+
+        fetcher.validate_condition_key.side_effect = mock_validate
+
+        statement = Statement(
+            Effect="Allow",
+            Action=["lambda:AddPermission"],
+            Resource=["arn:aws:lambda:*:123456789012:function:my-func"],
+            Condition={
+                "StringEquals": {
+                    "aws:RequestTag/owner": "test",
+                    "aws:RequestTag/env": "prod",
+                    "aws:PrincipalOrgID": "o-123",
+                }
+            },
+        )
+        issues = await check.execute(statement, 0, fetcher, config)
+
+        error_issues = [i for i in issues if i.issue_type == "invalid_condition_key"]
+        warning_issues = [i for i in issues if i.issue_type == "global_condition_key_with_action_specific"]
+
+        assert len(error_issues) == 1  # Aggregated
+        assert len(warning_issues) == 1  # Not affected

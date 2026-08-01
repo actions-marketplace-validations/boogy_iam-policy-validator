@@ -22,7 +22,8 @@ Key Validations:
    - Cross-account: Should have ExternalId or PrincipalOrgID
 
 4. Confused Deputy Prevention
-   - Service principals should use aws:SourceArn or aws:SourceAccount conditions
+   - Service principals should use aws:SourceArn / aws:SourceAccount conditions
+     (or the org-wide aws:SourceOrgID / aws:SourceOrgPaths)
    - Prevents services from being tricked into acting on behalf of unauthorized parties
 
 Complements existing checks:
@@ -30,7 +31,8 @@ Complements existing checks:
 - action_condition_enforcement: Validates required conditions for actions
 - trust_policy_validation: Validates action-principal coupling and trust-specific rules
 
-This check is DISABLED by default. Enable it for trust policy validation:
+This check is ENABLED by default (it self-gates on statements that have a
+Principal plus assume-role actions). Configure it via:
 
     trust_policy_validation:
       enabled: true
@@ -43,6 +45,7 @@ from typing import Any, ClassVar
 from iam_validator.checks.utils import format_list_with_backticks
 from iam_validator.core.aws_service import AWSServiceFetcher
 from iam_validator.core.check_registry import CheckConfig, PolicyCheck
+from iam_validator.core.constants import ARN_PARTITION_REGEX
 from iam_validator.core.models import Statement, ValidationIssue
 
 
@@ -75,13 +78,13 @@ class TrustPolicyValidationCheck(PolicyCheck):
         },
         "sts:AssumeRoleWithSAML": {
             "allowed_principal_types": ["Federated"],
-            "provider_pattern": r"^arn:aws:iam::\d{12}:saml-provider/[\w+=,.@-]+$",
+            "provider_pattern": rf"^arn:{ARN_PARTITION_REGEX}:iam::\d{{12}}:saml-provider/[\w+=,.@-]+$",
             "required_conditions": ["SAML:aud"],
             "description": "SAML-based federated role assumption",
         },
         "sts:AssumeRoleWithWebIdentity": {
             "allowed_principal_types": ["Federated"],
-            "provider_pattern": r"^arn:aws:iam::\d{12}:oidc-provider/[\w./-]+$",
+            "provider_pattern": rf"^arn:{ARN_PARTITION_REGEX}:iam::\d{{12}}:oidc-provider/[\w./-]+$",
             "required_conditions": ["*:aud"],  # Require audience condition (provider-specific key)
             "description": "OIDC-based federated role assumption",
         },
@@ -429,8 +432,9 @@ class TrustPolicyValidationCheck(PolicyCheck):
         """Check for confused deputy vulnerability in service principal trust policies.
 
         When a trust policy allows a service principal to assume a role without
-        aws:SourceArn or aws:SourceAccount conditions, any resource using that
-        service could assume the role, not just the intended one.
+        aws:SourceArn / aws:SourceAccount (or the org-wide aws:SourceOrgID /
+        aws:SourceOrgPaths) conditions, any resource using that service could
+        assume the role, not just the intended one.
 
         Args:
             statement: IAM policy statement
@@ -455,10 +459,15 @@ class TrustPolicyValidationCheck(PolicyCheck):
                 if isinstance(keys_dict, dict):
                     condition_keys.update(k.lower() for k in keys_dict.keys())
 
-        has_source_arn = "aws:sourcearn" in condition_keys
-        has_source_account = "aws:sourceaccount" in condition_keys
-
-        if has_source_arn or has_source_account:
+        # aws:SourceOrgID / aws:SourceOrgPaths are the org-wide equivalents of
+        # aws:SourceArn / aws:SourceAccount and count as protection too.
+        confused_deputy_protection_keys = {
+            "aws:sourcearn",
+            "aws:sourceaccount",
+            "aws:sourceorgid",
+            "aws:sourceorgpaths",
+        }
+        if condition_keys & confused_deputy_protection_keys:
             return issues
 
         # Flag each service principal that is not in the safe list
@@ -472,16 +481,24 @@ class TrustPolicyValidationCheck(PolicyCheck):
                     statement_sid=statement.sid,
                     statement_index=statement_idx,
                     issue_type="confused_deputy_risk",
+                    # Wording is policy-shape-neutral: this check fires at the
+                    # statement level on both role trust policies and resource
+                    # policies (SNS/SQS/S3/...) with a Service principal.
                     message=(
-                        f"Trust policy allows service principal `{service_principal}` "
-                        f"without `aws:SourceArn` or `aws:SourceAccount` condition. "
+                        f"Statement allows service principal `{service_principal}` "
+                        f"without an `aws:SourceArn`, `aws:SourceAccount`, "
+                        f"`aws:SourceOrgID`, or `aws:SourceOrgPaths` condition. "
                         f"This may be vulnerable to confused deputy attacks."
                     ),
                     suggestion=(
-                        f"Add an `aws:SourceArn` or `aws:SourceAccount` condition to restrict "
-                        f"which resources can assume this role via `{service_principal}`. "
-                        f"This prevents the confused deputy problem where a service could "
-                        f"be tricked into assuming the role on behalf of an unauthorized party."
+                        f"Add an `aws:SourceArn` or `aws:SourceAccount` condition "
+                        f"(or `aws:SourceOrgID` / `aws:SourceOrgPaths` for an "
+                        f"organization-wide boundary) to restrict which resources "
+                        f"`{service_principal}` may act on behalf of (for a role "
+                        f"trust policy: which resources can assume the role). This "
+                        f"prevents the confused deputy problem where the service "
+                        f"could be tricked into using this permission on behalf of "
+                        f"an unauthorized party."
                     ),
                     example=self._get_confused_deputy_example(service_principal),
                     line_number=statement.line_number,

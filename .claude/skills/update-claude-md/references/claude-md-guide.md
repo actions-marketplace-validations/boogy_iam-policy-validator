@@ -138,7 +138,6 @@ bun dev          # Start dev server
 bun test         # Run tests
 bun typecheck    # Type checking
 ```
-````
 
 ## Architecture
 
@@ -169,7 +168,6 @@ src/
 - Client-side vars need `NEXT_PUBLIC_` prefix
 - Always use `@/` prefix for imports from `src/`
 - Server Components are default, add `"use client"` only when needed
-
 ````
 
 ## Hooks Configuration Template
@@ -201,7 +199,7 @@ src/
     ]
   }
 }
-````
+```
 
 ## Best Practices
 

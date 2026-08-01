@@ -1,337 +1,178 @@
-# MCP Module - Model Context Protocol Server
+# MCP Module — Model Context Protocol Server
 
-**Purpose**: MCP server for AI assistants to generate, validate, and query AWS IAM policies
-**Parent Context**: Extends [../../CLAUDE.md](../../CLAUDE.md)
-
----
-
-## Overview
-
-The MCP (Model Context Protocol) module provides a FastMCP server that exposes the IAM Policy Validator functionality to AI assistants like Claude Desktop. It enables AI-powered policy generation with security-first design, validation, and AWS service queries.
-
-**Key Features**:
-
-- 25+ MCP tools across validation, generation, query, and organization config domains
-- 10 built-in policy templates with variable substitution
-- 6 MCP Resources for static data (templates, checks, sensitive categories, org config)
-- Organization-wide policy configuration with session persistence
-- Batch operations for reduced round-trips
-- Lifespan management with shared AWSServiceFetcher
-
-**Entry Point**: `iam-validator-mcp` command (runs `iam_validator.mcp:run_server`)
+FastMCP server exposing IAM validation, generation, AWS-query, and Access
+Analyzer tools to AI assistants. Entry point: `iam-validator-mcp` (calls
+`iam_validator.mcp:run_server`). Extends [../../CLAUDE.md](../../CLAUDE.md).
 
 ---
 
-## Quick Start
-
-### Running with uvx (Recommended for End Users)
-
-The easiest way to run the MCP server is using `uvx` directly from PyPI - no installation required:
+## Run (dev)
 
 ```bash
-# Run the MCP server directly from PyPI
-uvx --from "iam-policy-validator[mcp]" iam-validator-mcp
-
-# With organization config pre-loaded
-uvx --from "iam-policy-validator[mcp]" iam-validator-mcp --org-config ./org-policy.yaml
+uv sync --extra mcp && iam-validator-mcp
+mise run mcp:inspector                                # debug with MCP Inspector
+iam-validator-mcp --config ./iam-validator.yaml       # pre-load config
+iam-validator-mcp --custom-checks-dir ./my-checks     # CLI parity (custom checks)
+iam-validator-mcp --aws-services-dir ./aws-services   # CLI parity (offline AWS data)
+iam-validator-mcp --profile validate-only             # token-efficient profile
+iam-validator-mcp --list-profiles                     # print profile taxonomy
 ```
 
-### Running for Local Development
-
-```bash
-# Install with MCP extras
-uv sync --extra mcp
-
-# Run the MCP server (stdio transport for Claude Desktop)
-iam-validator-mcp
-
-# Run with organization config pre-loaded
-iam-validator-mcp --org-config ./org-policy.yaml
-
-# Debug with MCP Inspector
-make mcp-inspector
-```
-
-### Claude Desktop Configuration
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-**Option 1: Using uvx (recommended for end users)**
-
-```json
-{
-  "mcpServers": {
-    "iam-policy-validator": {
-      "command": "uvx",
-      "args": ["--from", "iam-policy-validator[mcp]", "iam-validator-mcp"]
-    }
-  }
-}
-```
-
-**Option 2: Using uv with local development checkout**
-
-```json
-{
-  "mcpServers": {
-    "iam-policy-validator": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/iam-policy-auditor",
-        "--extra",
-        "mcp",
-        "iam-validator-mcp"
-      ]
-    }
-  }
-}
-```
-
-**Option 3: With organization config**
-
-```json
-{
-  "mcpServers": {
-    "iam-policy-validator": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "iam-policy-validator[mcp]",
-        "iam-validator-mcp",
-        "--org-config",
-        "/path/to/org-policy.yaml"
-      ]
-    }
-  }
-}
-```
+End-user install + Claude Desktop config: see `docs/integrations/mcp-server.md`.
 
 ---
 
-## Module Structure
+## Layout
 
 ```
-iam_validator/mcp/
-├── __init__.py            # Package exports (create_server, run_server, models)
-├── server.py              # FastMCP server with 25+ tool registrations + 6 resources
-├── models.py              # 5 Pydantic models for request/response types
-├── session_config.py      # Session configuration manager (ValidatorConfig wrapper)
+mcp/
+├── __init__.py            # CLI argparse, entry-point, profile dispatch
+├── server.py              # FastMCP server: 33 @mcp.tool, 8 @mcp.resource (~2.5K lines)
+├── models.py              # 5 Pydantic request/response models
+├── session_config.py      # ValidatorConfig + CLI-paths storage (custom_checks_dir, aws_services_dir)
+├── check_metadata.py      # 12 curated examples driving get_issue_guidance / iam://checks/{check_id}
 ├── tools/
-│   ├── __init__.py        # Tools package (exports all tool implementations)
-│   ├── validation.py      # Validation tool implementations
-│   ├── generation.py      # Generation tool implementations
-│   ├── query.py           # Query tool implementations
-│   └── org_config_tools.py # Organization config tool implementations
+│   ├── validation.py      # validate_policy, quick_validate (forwards SessionConfigManager paths)
+│   ├── generation.py      # generate_policy_from_template, build_minimal_policy, suggest_actions, …
+│   ├── query.py           # query_service_actions, query_action_details, expand_wildcard_action, …
+│   ├── analyze.py         # analyze_policy — wraps boto3 Access Analyzer in asyncio.to_thread
+│   └── org_config_tools.py # set/get/clear organization_config, check_org_compliance, validate_with_config
 └── templates/
-    ├── __init__.py        # Template loading interface
-    └── builtin.py         # 15 built-in policy templates
+    ├── __init__.py
+    └── builtin.py         # 15 templates with variable substitution
 ```
 
----
-
-## Tools Reference
-
-### Validation Tools (3)
-
-| Tool                      | Purpose                  | Input                                        |
-| ------------------------- | ------------------------ | -------------------------------------------- |
-| `validate_policy`         | Validate IAM policy dict | policy, policy_type, verbose, use_org_config |
-| `quick_validate`          | Quick pass/fail check    | policy                                       |
-| `validate_policies_batch` | Batch validate multiple  | policies[], policy_type, verbose             |
-
-### Generation Tools (6)
-
-| Tool                            | Purpose                          | Input                    |
-| ------------------------------- | -------------------------------- | ------------------------ |
-| `generate_policy_from_template` | Generate from built-in template  | template_name, variables |
-| `build_minimal_policy`          | Build from actions + resources   | actions, resources       |
-| `list_templates`                | List available templates         | (none)                   |
-| `suggest_actions`               | Suggest actions from description | description, service     |
-| `get_required_conditions`       | Get required conditions          | actions                  |
-| `check_sensitive_actions`       | Check if actions are sensitive   | actions                  |
-
-### Query Tools (10)
-
-| Tool                                    | Purpose                     | Input                 |
-| --------------------------------------- | --------------------------- | --------------------- |
-| `query_service_actions`                 | Get actions for service     | service, access_level |
-| `query_action_details`                  | Get action metadata         | action                |
-| `expand_wildcard_action`                | Expand `s3:Get*` to actions | pattern               |
-| `query_condition_keys`                  | Get condition keys for svc  | service               |
-| `query_arn_formats`                     | Get ARN formats for service | service               |
-| `list_checks`                           | List all validation checks  | (none)                |
-| `get_policy_summary`                    | Analyze policy structure    | policy                |
-| `list_sensitive_actions`                | List sensitive actions      | category, limit       |
-| `get_condition_requirements_for_action` | Get condition requirements  | action                |
-| `query_actions_batch`                   | Batch query action details  | actions[]             |
-
-### Organization Config Tools (6)
-
-| Tool                                 | Purpose                     | Input          |
-| ------------------------------------ | --------------------------- | -------------- |
-| `set_organization_config`            | Set session-wide org config | config dict    |
-| `get_organization_config`            | Get current org config      | (none)         |
-| `clear_organization_config`          | Clear session org config    | (none)         |
-| `load_organization_config_from_yaml` | Load org config from YAML   | yaml_content   |
-| `check_org_compliance`               | Check policy against org    | policy         |
-| `validate_with_config`               | Validate with inline config | policy, config |
+`server.py` lifespan owns one shared `AWSServiceFetcher` AND a per-`(region,
+profile)` boto3 session cache so all tool calls reuse them.
 
 ---
 
-## Built-in Templates (15)
+## Tools (33) — tagged for `--profile` gating
 
-| Template                    | Description                          | Variables                                      |
-| --------------------------- | ------------------------------------ | ---------------------------------------------- |
-| `s3-read-only`              | S3 bucket read-only access           | bucket_name, prefix (optional)                 |
-| `s3-read-write`             | S3 bucket read-write access          | bucket_name, prefix (optional)                 |
-| `lambda-basic-execution`    | Basic Lambda execution role          | account_id, region, function_name              |
-| `lambda-s3-trigger`         | Lambda with S3 event trigger         | bucket_name, function_name, account_id, region |
-| `dynamodb-crud`             | DynamoDB table CRUD operations       | table_name, region, account_id                 |
-| `cloudwatch-logs`           | CloudWatch Logs write permissions    | log_group_prefix, region, account_id           |
-| `secrets-manager-read`      | Secrets Manager read access          | secret_prefix, region, account_id              |
-| `kms-encrypt-decrypt`       | KMS key encryption/decryption        | key_id, region, account_id                     |
-| `ec2-describe`              | EC2 describe-only permissions        | (none)                                         |
-| `ecs-task-execution`        | ECS task execution role              | account_id, region                             |
-| `sqs-consumer`              | SQS queue consumer permissions       | queue_name, region, account_id                 |
-| `sns-publisher`             | SNS topic publisher permissions      | topic_name, region, account_id                 |
-| `step-functions-execution`  | Step Functions execution permissions | state_machine_name, region, account_id         |
-| `api-gateway-invoke`        | API Gateway invoke permissions       | api_id, stage, region, account_id              |
-| `cross-account-assume-role` | Cross-account role trust policy      | trusted_account_id, external_id                |
+Every tool carries exactly one functional tag (some also carry `mutating`).
+The `--profile` flag uses these tags to enable/disable groups:
+
+| Tag          | Tools                                                                                                                                                                                                                                               |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `validate`   | `validate_policy`, `quick_validate`, `validate_policies_batch`, `get_policy_summary`, `get_active_profile`                                                                                                                                          |
+| `query`      | `query_service_actions`, `query_action_details`, `expand_wildcard_action`, `query_condition_keys`, `query_arn_formats`, `get_condition_requirements_for_action`, `query_actions_batch`, `check_actions_batch`                                       |
+| `generation` | `generate_policy_from_template`, `build_minimal_policy`, `suggest_actions`, `get_required_conditions`, `check_sensitive_actions`                                                                                                                    |
+| `fix`        | `fix_policy_issues`, `get_issue_guidance`, `explain_policy`, `compare_policies`, `build_arn` (live-data tool: consults `query_arn_formats`)                                                                                                         |
+| `orgconfig`  | `set_/get_/clear_organization_config` (set/clear also tagged `mutating`), `load_organization_config_from_yaml` (also `mutating`), `check_org_compliance`, `validate_with_config`, `set_/get_/clear_custom_instructions` (set/clear also `mutating`) |
+| `analyze`    | `aws_access_analyzer_validate` (only tool with `openWorldHint=True` — calls live AWS API)                                                                                                                                                           |
+
+### Profiles
+
+| Profile              | Behaviour                                                   |
+| -------------------- | ----------------------------------------------------------- |
+| `full`               | All tools (default)                                         |
+| `validate-only`      | Only `validate` tag — smallest token footprint              |
+| `validate-and-query` | `validate` + `query` (no live AWS API; analyze is excluded) |
+| `no-generation`      | Everything except `generation`                              |
+| `read-only`          | Excludes anything tagged `mutating` — useful for CI/sandbox |
+
+`apply_profile` snapshots `mcp._transforms` (FastMCP private attr) at module
+load so successive profile changes can reset cleanly. The
+`tests/mcp/test_profiles.py::test_apply_profile_is_not_an_mcp_tool` regression
+test guards against accidentally exposing the helper as a tool.
+
+### Token cost
+
+Tags + tool annotations + slimmed `BASE_INSTRUCTIONS` produce these footprints
+(instructions + tool descriptions, characters):
+
+| Profile              | Tools | Total | % full |
+| -------------------- | ----- | ----- | ------ |
+| `full`               | 33    | 4445  | 100%   |
+| `validate-only`      | 5     | 1609  | 36%    |
+| `validate-and-query` | 13    | 2173  | 48%    |
+
+## Resources (8)
+
+Static resources cache client-side and don't count against per-turn token
+budget the way tool descriptions do:
+
+- `iam://templates` — list of available policy templates
+- `iam://checks` — registered check catalog (id, description, default_severity)
+- `iam://sensitive-categories` — sensitive-action category descriptions
+- `iam://sensitive-actions/{category}` — actions for a category (parameterized)
+- `iam://checks/{check_id}` — per-check docs, registry-driven (parameterized)
+- `iam://config-schema` — JSON Schema for session config
+- `iam://config-examples` — example YAML configs by security posture
+- `iam://workflow-examples` — guided example workflows
+
+## Templates (15)
+
+`s3-read-only`, `s3-read-write`, `lambda-basic-execution`, `lambda-s3-trigger`,
+`dynamodb-crud`, `cloudwatch-logs`, `secrets-manager-read`, `kms-encrypt-decrypt`,
+`ec2-describe`, `ecs-task-execution`, `sqs-consumer`, `sns-publisher`,
+`step-functions-execution`, `api-gateway-invoke`, `cross-account-assume-role`.
 
 ---
 
-## MCP Resources (6)
+## Adding things
 
-| Resource URI                 | Content                             |
-| ---------------------------- | ----------------------------------- |
-| `iam://templates`            | All policy templates with variables |
-| `iam://checks`               | All 21 validation checks            |
-| `iam://sensitive-categories` | Sensitive action category metadata  |
-| `iam://org-config-schema`    | JSON Schema for OrganizationConfig  |
-| `iam://org-config-examples`  | Example org configs for scenarios   |
-| `iam://workflow-examples`    | Detailed workflow examples          |
+### Tool
 
----
+Implement in `tools/<category>.py`, then register in `server.py` with
+`@mcp.tool(tags={"<one-tag>"}, annotations=ToolAnnotations(...))` plus a
+docstring (the docstring becomes the Claude-facing description). Pick a single
+tag; if it could fit two, the dominant one is right.
 
-## Development
-
-### Adding a New Tool
-
-1. **Define implementation** in `tools/validation.py`, `tools/generation.py`, or `tools/query.py`
-2. **Register in server.py** with `@mcp.tool()` decorator
-3. **Add docstring** describing parameters and return value
-4. **Test** via Claude Desktop or `make mcp-inspector`
+### Resource
 
 ```python
-# In tools/query.py
-async def my_query_tool(param1: str) -> dict[str, Any]:
-    """Implementation."""
-    return {"result": param1}
-
-# In server.py
-@mcp.tool()
-async def my_query_tool(param1: str) -> dict[str, Any]:
-    """Short description that appears in Claude Desktop.
-
-    Args:
-        param1: Description of param1
-
-    Returns:
-        Dictionary with result data
-    """
-    from iam_validator.mcp.tools.query import my_query_tool as _impl
-    return await _impl(param1=param1)
-```
-
-### Adding a New Resource
-
-```python
-# In server.py
 @mcp.resource("iam://my-resource")
 async def my_resource() -> str:
-    """Description of what this resource provides."""
-    import json
-    data = {"key": "value"}
-    return json.dumps(data, indent=2)
+    """What this exposes."""
+    return json.dumps({...}, indent=2)
 ```
 
-### Adding a New Template
+Parameterized:
 
-Add to `templates/builtin.py:TEMPLATES`:
+```python
+@mcp.resource("iam://my-thing/{name}")
+async def my_thing(name: str) -> str:
+    return json.dumps({"name": name, "data": ...}, indent=2)
+```
+
+### Curated check example
+
+If a new check has a clean, short example, add an entry to `CHECK_EXAMPLES` in
+`iam_validator/mcp/check_metadata.py`. Without an entry, `get_issue_guidance`
+falls back to registry-driven defaults (description + severity from the check
+class) — already useful, just less specific.
+
+### Template
+
+Append to `TEMPLATES` in `templates/builtin.py` — one entry per template:
 
 ```python
 TEMPLATES["my-template"] = {
     "name": "my-template",
     "description": "What this template does",
-    "variables": [
-        {"name": "param1", "description": "Description", "required": True},
-        {"name": "param2", "description": "Optional", "required": False, "default": ""},
-    ],
-    "policy": {
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Sid": "MyStatement",
-            "Effect": "Allow",
-            "Action": ["service:Action"],
-            "Resource": "arn:aws:service:region:account:${param1}",
-        }]
-    }
+    "variables": [{"name": "param1", "description": "...", "required": True}],
+    "policy": {"Version": "2012-10-17", "Statement": [...]},
 }
 ```
 
 ---
 
-## Testing
+## Tests
 
 ```bash
-# Test all MCP tools
 uv run pytest tests/mcp/
-
-# Test specific module
-uv run pytest tests/mcp/test_validation_tools.py
-uv run pytest tests/mcp/test_generation_tools.py
-uv run pytest tests/mcp/test_org_config.py
-uv run pytest tests/mcp/test_templates.py
-
-# Debug with MCP Inspector
-make mcp-inspector
 ```
 
----
+Test files of note:
 
-## Quick Search
+- `test_constants_alignment.py` — guard rails: MCP must source shared literals from `core/constants`
+- `test_check_metadata.py` — every registered check must yield useful guidance
+- `test_build_arn.py` — placeholders dict, deprecated `resource_name`, partition validation
+- `test_profiles.py` — tag-based gating + idempotency
+- `test_transport.py` — in-process FastMCP `Client` round-trip (annotations, resources, errors)
+- `test_analyze.py` — Access Analyzer wrapper + cached boto3 session
 
-```bash
-# Find all MCP tools
-rg -n "@mcp.tool" server.py
-
-# Find all MCP resources
-rg -n "@mcp.resource" server.py
-
-# Find template definitions
-rg -n '"name":' templates/builtin.py
-
-# Find model definitions
-rg -n "class.*BaseModel" .
-
-# Find all exported functions
-rg -n "__all__" .
-```
-
----
-
-## Dependencies
-
-**Required**: `fastmcp>=2.0.0`
-
-**Installation**:
-
-```bash
-# Install with MCP support
-uv sync --extra mcp
-
-# Or with pip
-pip install iam-policy-validator[mcp]
-```
+Mock fetcher / network — no real API or AWS calls. Debug interactively via
+`mise run mcp:inspector`. Requires `fastmcp>=3.2,<4` (installed via
+`uv sync --extra mcp`).

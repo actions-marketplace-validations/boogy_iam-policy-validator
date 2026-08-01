@@ -12,6 +12,7 @@ from iam_validator.core.constants import (
     BOT_IDENTIFIER,
     REVIEW_IDENTIFIER,
     SUMMARY_IDENTIFIER,
+    scoped_marker,
 )
 from iam_validator.core.diff_parser import DiffParser
 from iam_validator.core.label_manager import LabelManager
@@ -36,6 +37,7 @@ class ContextIssue:
         statement_index: int,
         line_number: int,
         issue: ValidationIssue,
+        in_modified_statement: bool = False,
     ):
         """Initialize context issue.
 
@@ -44,17 +46,21 @@ class ContextIssue:
             statement_index: Zero-based statement index
             line_number: Line number where the issue exists
             issue: The validation issue
+            in_modified_statement: Whether the issue is in a statement that was modified in the PR
         """
         self.file_path = file_path
         self.statement_index = statement_index
         self.line_number = line_number
         self.issue = issue
+        self.in_modified_statement = in_modified_statement
 
 
 class PRCommenter:
     """Posts validation findings as PR comments."""
 
-    # Load identifiers from constants module for consistency
+    # Module-level defaults preserved as class attrs for backward compatibility
+    # with code that reads ``PRCommenter.SUMMARY_IDENTIFIER`` etc. The instance
+    # attributes set in ``__init__`` shadow these and carry the optional tag.
     BOT_IDENTIFIER = BOT_IDENTIFIER
     SUMMARY_IDENTIFIER = SUMMARY_IDENTIFIER
     REVIEW_IDENTIFIER = REVIEW_IDENTIFIER
@@ -67,6 +73,8 @@ class PRCommenter:
         severity_labels: dict[str, str | list[str]] | None = None,
         enable_codeowners_ignore: bool = True,
         allowed_ignore_users: list[str] | None = None,
+        off_diff_comment_mode: str = "summary_only",
+        comment_tag: str | None = None,
     ):
         """Initialize PR commenter.
 
@@ -85,6 +93,17 @@ class PRCommenter:
                              - Mixed: {"error": "iam-validity-error", "critical": ["security-critical", "needs-review"]}
             enable_codeowners_ignore: Whether to enable CODEOWNERS-based ignore feature
             allowed_ignore_users: Fallback users who can ignore findings when no CODEOWNERS
+            off_diff_comment_mode: How to handle findings on unchanged lines.
+                                  "summary_only" (default): All off-diff issues in summary only.
+                                  "individual": Post each as an individual review comment.
+                                  "modified_statements_only": Individual comments for modified statements only.
+            comment_tag: Optional run scope (e.g. ``"role"``, ``"policy"``).
+                When set, the summary, review, and ignored-findings markers
+                are scoped via :func:`scoped_marker` so multiple runs on the
+                same PR (e.g. one per policy type executed in parallel) keep
+                independent comment threads instead of overwriting each
+                other's comments. ``None`` preserves the legacy markers,
+                making the feature fully opt-in and backward compatible.
         """
         self.github = github
         self.cleanup_old_comments = cleanup_old_comments
@@ -92,6 +111,12 @@ class PRCommenter:
         self.severity_labels = severity_labels or {}
         self.enable_codeowners_ignore = enable_codeowners_ignore
         self.allowed_ignore_users = allowed_ignore_users or []
+        self.off_diff_comment_mode = off_diff_comment_mode
+        self.comment_tag = comment_tag
+        # Resolve scoped identifiers once. With no tag these equal the
+        # module-level defaults exactly — see scoped_marker contract.
+        self.SUMMARY_IDENTIFIER = scoped_marker(SUMMARY_IDENTIFIER, comment_tag)
+        self.REVIEW_IDENTIFIER = scoped_marker(REVIEW_IDENTIFIER, comment_tag)
         # Track issues in modified statements that are on unchanged lines
         self._context_issues: list[ContextIssue] = []
         # Track ignored finding IDs for the current run
@@ -381,7 +406,10 @@ class PRCommenter:
                             {
                                 "path": relative_path,
                                 "line": comment_line,
-                                "body": issue.to_pr_comment(file_path=relative_path),
+                                "body": issue.to_pr_comment(
+                                    file_path=relative_path,
+                                    review_identifier=self.REVIEW_IDENTIFIER,
+                                ),
                             }
                         )
                         logger.debug(
@@ -401,7 +429,10 @@ class PRCommenter:
                         {
                             "path": relative_path,
                             "line": line_number,
-                            "body": issue.to_pr_comment(file_path=relative_path),
+                            "body": issue.to_pr_comment(
+                                file_path=relative_path,
+                                review_identifier=self.REVIEW_IDENTIFIER,
+                            ),
                         }
                     )
                     logger.debug(
@@ -410,7 +441,11 @@ class PRCommenter:
                     )
                 elif issue.statement_index in modified_statements:
                     # Issue in modified statement but on unchanged line - save for summary
-                    self._context_issues.append(ContextIssue(relative_path, issue.statement_index, line_number, issue))
+                    self._context_issues.append(
+                        ContextIssue(
+                            relative_path, issue.statement_index, line_number, issue, in_modified_statement=True
+                        )
+                    )
                     context_issue_count += 1
                     logger.debug(
                         f"Context issue: {relative_path}:{line_number} (statement {issue.statement_index} modified) - {issue.issue_type}"
@@ -429,10 +464,22 @@ class PRCommenter:
             f"{context_issue_count} context issues for summary"
         )
 
-        # Post off-diff comments for context issues (line-level or file-level fallback)
+        # Post off-diff comments based on off_diff_comment_mode setting
         protected_fingerprints: set[str] = set()
         if self._context_issues:
-            protected_fingerprints, self._context_issues = await self._post_off_diff_comments(self._context_issues)
+            if self.off_diff_comment_mode == "individual":
+                # Post all off-diff issues as individual comments
+                protected_fingerprints, self._context_issues = await self._post_off_diff_comments(self._context_issues)
+            elif self.off_diff_comment_mode == "modified_statements_only":
+                # Only post individual comments for issues in modified statements
+                modified_issues = [ci for ci in self._context_issues if ci.in_modified_statement]
+                unchanged_issues = [ci for ci in self._context_issues if not ci.in_modified_statement]
+                if modified_issues:
+                    protected_fingerprints, remaining = await self._post_off_diff_comments(modified_issues)
+                    self._context_issues = remaining + unchanged_issues
+                else:
+                    self._context_issues = unchanged_issues
+            # else: summary_only (default) - skip individual posting, all go to summary
 
         # Even if no inline comments, we still need to run cleanup to delete stale comments
         # from previous runs where findings have been resolved (unless cleanup is disabled)
@@ -492,8 +539,10 @@ class PRCommenter:
     async def _post_off_diff_comments(self, off_diff_issues: list[ContextIssue]) -> tuple[set[str], list[ContextIssue]]:
         """Post comments for issues found outside the PR diff.
 
-        Attempts to post each issue as a line-level review comment first,
-        then falls back to a file-level comment if that fails. Issues that
+        Uses fingerprint-based deduplication to avoid posting duplicate comments
+        on subsequent runs. Existing comments are updated if the body changed,
+        or skipped if unchanged. New issues are posted as line-level review
+        comments first, with a fallback to file-level comments. Issues that
         cannot be posted at all are returned for inclusion in the summary.
 
         Args:
@@ -516,15 +565,49 @@ class PRCommenter:
             return set(), off_diff_issues
 
         commit_id = pr_info["head"]["sha"]
+
+        # Fetch existing bot comments indexed by fingerprint to avoid duplicates
+        existing_by_fingerprint = await self.github._get_bot_comments_by_fingerprint(self.REVIEW_IDENTIFIER)
+
         posted_fingerprints: set[str] = set()
         remaining: list[ContextIssue] = []
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
 
         for ctx_issue in off_diff_issues:
-            body = ctx_issue.issue.to_pr_comment(file_path=ctx_issue.file_path)
+            fp_hash = FindingFingerprint.from_issue(ctx_issue.issue, ctx_issue.file_path).to_hash()
+            body = ctx_issue.issue.to_pr_comment(
+                file_path=ctx_issue.file_path,
+                review_identifier=self.REVIEW_IDENTIFIER,
+            )
             body += (
                 f"\n\n> **Note:** This finding is on line {ctx_issue.line_number}, which was not modified in this PR."
             )
 
+            # Check if a comment with this fingerprint already exists
+            existing = existing_by_fingerprint.get(fp_hash)
+            if existing:
+                if existing["body"] != body:
+                    # Body changed (e.g., message updated) - update existing comment
+                    updated = await self.github.update_review_comment(existing["id"], body)
+                    if updated:
+                        posted_fingerprints.add(fp_hash)
+                        updated_count += 1
+                        logger.debug(f"Updated off-diff comment: {ctx_issue.file_path}:{ctx_issue.line_number}")
+                    else:
+                        # Update failed - fall back to remaining for summary
+                        remaining.append(ctx_issue)
+                        logger.warning(
+                            f"Failed to update off-diff comment: {ctx_issue.file_path}:{ctx_issue.line_number}"
+                        )
+                else:
+                    posted_fingerprints.add(fp_hash)
+                    skipped_count += 1
+                    logger.debug(f"Skipped existing off-diff comment: {ctx_issue.file_path}:{ctx_issue.line_number}")
+                continue
+
+            # New finding - post as review comment
             # Try line-level comment first
             posted = await self.github.create_review_comment(
                 commit_id, ctx_issue.file_path, ctx_issue.line_number, body
@@ -535,14 +618,17 @@ class PRCommenter:
                 posted = await self.github.create_file_level_comment(commit_id, ctx_issue.file_path, body)
 
             if posted:
-                fp_hash = FindingFingerprint.from_issue(ctx_issue.issue, ctx_issue.file_path).to_hash()
                 posted_fingerprints.add(fp_hash)
+                created_count += 1
                 logger.debug(f"Posted off-diff comment: {ctx_issue.file_path}:{ctx_issue.line_number}")
             else:
                 remaining.append(ctx_issue)
                 logger.debug(f"Failed to post off-diff comment: {ctx_issue.file_path}:{ctx_issue.line_number}")
 
-        logger.info(f"Off-diff comments: {len(posted_fingerprints)} posted, {len(remaining)} remaining for summary")
+        logger.info(
+            f"Off-diff comments: {created_count} created, {updated_count} updated, "
+            f"{skipped_count} unchanged, {len(remaining)} remaining for summary"
+        )
         return posted_fingerprints, remaining
 
     def _make_relative_path(self, policy_file: str) -> str | None:
@@ -767,6 +853,7 @@ class PRCommenter:
         processor = IgnoreCommandProcessor(
             github=self.github,
             allowed_users=self.allowed_ignore_users,
+            comment_tag=self.comment_tag,
         )
         ignored_count = await processor.process_pending_ignores()
         if ignored_count > 0:
@@ -781,7 +868,7 @@ class PRCommenter:
             IgnoredFindingsStore,
         )
 
-        store = IgnoredFindingsStore(self.github)
+        store = IgnoredFindingsStore(self.github, comment_tag=self.comment_tag)
         # Load full ignored findings for display in summary
         self._ignored_findings = await store.load()
         # Also get just the IDs for fast lookup
@@ -845,6 +932,8 @@ async def post_report_to_pr(
     create_review: bool = True,
     add_summary: bool = True,
     config_path: str | None = None,
+    off_diff_comment_mode: str | None = None,
+    comment_tag: str | None = None,
 ) -> bool:
     """Post a JSON report to a PR.
 
@@ -853,6 +942,9 @@ async def post_report_to_pr(
         create_review: Whether to create line-specific review
         add_summary: Whether to add summary comment
         config_path: Optional path to config file (to get fail_on_severity)
+        off_diff_comment_mode: How to handle findings on unchanged lines (overrides config)
+        comment_tag: Optional run scope; CLI override takes precedence over the
+            ``comment_tag`` config setting. See :class:`PRCommenter` for details.
 
     Returns:
         True if successful, False otherwise
@@ -878,6 +970,13 @@ async def post_report_to_pr(
         enable_codeowners_ignore = ignore_settings.get("enabled", True)
         allowed_ignore_users = ignore_settings.get("allowed_users", [])
 
+        # Get off-diff comment mode (CLI override > config > default)
+        off_diff_mode = off_diff_comment_mode or config.get_setting("off_diff_comment_mode", "summary_only")
+
+        # Comment tag (CLI override > config > unset). ``None`` keeps the
+        # legacy markers, so the default behaviour is unchanged.
+        resolved_tag = comment_tag or config.get_setting("comment_tag", None)
+
         # Post to PR
         async with GitHubIntegration() as github:
             commenter = PRCommenter(
@@ -886,6 +985,8 @@ async def post_report_to_pr(
                 severity_labels=severity_labels,
                 enable_codeowners_ignore=enable_codeowners_ignore,
                 allowed_ignore_users=allowed_ignore_users,
+                off_diff_comment_mode=off_diff_mode,
+                comment_tag=resolved_tag,
             )
             return await commenter.post_findings_to_pr(
                 report,

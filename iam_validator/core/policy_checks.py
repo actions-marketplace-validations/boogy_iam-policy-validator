@@ -14,7 +14,7 @@ from pathlib import Path
 from iam_validator.core import constants
 from iam_validator.core.aws_service import AWSServiceFetcher
 from iam_validator.core.check_registry import CheckRegistry, create_default_registry
-from iam_validator.core.config.config_loader import ConfigLoader
+from iam_validator.core.config.config_loader import ConfigLoader, ValidatorConfig
 from iam_validator.core.models import (
     IAMPolicy,
     PolicyType,
@@ -24,6 +24,110 @@ from iam_validator.core.models import (
 from iam_validator.core.policy_loader import PolicyLoader
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_policy_type(
+    policy: IAMPolicy,
+    policy_file: str,
+    cli_policy_type: PolicyType | None,
+    config: ValidatorConfig,
+) -> tuple[PolicyType, str, str | None]:
+    """Resolve the PolicyType to use for a single policy.
+
+    Priority:
+      1. ``cli_policy_type`` (from CLI flag / SDK kwarg) — authoritative.
+      2. ``policy_types:`` glob mapping in config — first match wins.
+      3. Content auto-detection via ``detect_policy_type()``.
+      4. Default ``IDENTITY_POLICY``.
+
+    Args:
+        policy: Parsed IAM policy.
+        policy_file: Path to the policy file (used for glob matching and logs).
+        cli_policy_type: Type explicitly requested by the caller, or ``None``.
+        config: Loaded validator config (used for the glob list).
+
+    Returns:
+        A ``(resolved_type, source, matched_pattern)`` tuple where ``source``
+        is one of ``"cli-flag"``, ``"config-glob"``, ``"auto-detect"``,
+        ``"default"`` and ``matched_pattern`` is the glob that matched when
+        ``source == "config-glob"`` (otherwise ``None``).
+    """
+    if cli_policy_type is not None:
+        return cli_policy_type, "cli-flag", None
+
+    glob_type = config.get_policy_type_for_path(policy_file)
+    if glob_type is not None:
+        matched_pattern: str | None = None
+        for entry in config.policy_types:
+            if glob_type == entry["type"]:
+                matched_pattern = entry["pattern"]
+                break
+        return glob_type, "config-glob", matched_pattern
+
+    # Lazy import — `iam_validator.checks` pulls the whole package which
+    # transitively imports from `iam_validator.sdk`, which imports from this
+    # module. Importing inside the function breaks the cycle.
+    from iam_validator.checks.policy_structure import (  # pylint: disable=import-outside-toplevel
+        detect_policy_type,
+    )
+
+    detected = detect_policy_type(policy)
+    if detected != "IDENTITY_POLICY":
+        return detected, "auto-detect", None
+
+    return "IDENTITY_POLICY", "default", None
+
+
+_ALLOWED_POLICY_TYPES: frozenset[str] = frozenset(
+    {
+        "IDENTITY_POLICY",
+        "RESOURCE_POLICY",
+        "TRUST_POLICY",
+        "SERVICE_CONTROL_POLICY",
+        "RESOURCE_CONTROL_POLICY",
+    }
+)
+
+
+def _log_resolved_policy_type(policy_file: str, resolved_type: PolicyType, source: str, pattern: str | None) -> None:
+    """Emit the single machine-greppable debug line per policy.
+
+    Every logged field is derived from a closed-set allowlist or an integer
+    length — this breaks CodeQL's taint flow from the YAML config into the
+    log sink so ``py/clear-text-logging-sensitive-data`` does not fire on
+    non-sensitive resolution metadata. The raw ``pattern`` glob is not
+    logged (users can inspect their own config); we log its length and a
+    presence flag instead.
+
+    Format (one of):
+        policy_type=<TYPE> source=cli-flag file=<basename>
+        policy_type=<TYPE> source=config-glob pattern_present=true pattern_len=<n> file=<basename>
+        policy_type=<TYPE> source=auto-detect file=<basename>
+        policy_type=<TYPE> source=default file=<basename>
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    safe_type = resolved_type if resolved_type in _ALLOWED_POLICY_TYPES else "UNKNOWN"
+    file_name = Path(policy_file).name
+
+    if source == "cli-flag":
+        logger.debug("policy_type=%s source=cli-flag file=%s", safe_type, file_name)
+    elif source == "config-glob" and pattern is not None:
+        logger.debug(
+            "policy_type=%s source=config-glob pattern_present=true pattern_len=%d file=%s",
+            safe_type,
+            len(pattern),
+            file_name,
+        )
+    elif source == "config-glob":
+        logger.debug("policy_type=%s source=config-glob file=%s", safe_type, file_name)
+    elif source == "auto-detect":
+        logger.debug("policy_type=%s source=auto-detect file=%s", safe_type, file_name)
+    elif source == "default":
+        logger.debug("policy_type=%s source=default file=%s", safe_type, file_name)
+    else:
+        logger.debug("policy_type=%s source=unknown file=%s", safe_type, file_name)
 
 
 def _should_fail_on_issue(issue: ValidationIssue, fail_on_severities: list[str] | None = None) -> bool:
@@ -48,8 +152,9 @@ async def validate_policies(
     policies: list[tuple[str, IAMPolicy]] | list[tuple[str, IAMPolicy, dict]],
     config_path: str | None = None,
     custom_checks_dir: str | None = None,
-    policy_type: PolicyType = "IDENTITY_POLICY",
+    policy_type: PolicyType | None = None,
     aws_services_dir: str | None = None,
+    allow_config_custom_checks: bool = False,
 ) -> list[PolicyValidationResult]:
     """Validate multiple policies concurrently.
 
@@ -57,9 +162,19 @@ async def validate_policies(
         policies: List of (file_path, policy) or (file_path, policy, raw_dict) tuples
         config_path: Optional path to configuration file
         custom_checks_dir: Optional path to directory containing custom checks for auto-discovery
-        policy_type: Type of policy (IDENTITY_POLICY, RESOURCE_POLICY, SERVICE_CONTROL_POLICY)
+        policy_type: Explicit policy type to apply to *every* policy in the run.
+            When ``None`` (default), each policy's type is resolved per-file via
+            the config ``policy_types:`` glob list, then content auto-detection,
+            then a final fallback to ``IDENTITY_POLICY``.
         aws_services_dir: Optional path to directory containing pre-downloaded AWS service definitions
                          (enables offline mode, overrides config setting)
+        allow_config_custom_checks: Allow auto-discovery from a ``custom_checks_dir``
+            that comes from the YAML config file. Auto-discovery executes
+            arbitrary Python from that directory, and the config file often
+            ships in the same repository as the (potentially untrusted)
+            policies being validated — so mere config presence is not treated
+            as consent. Passing ``custom_checks_dir`` explicitly (CLI flag /
+            SDK argument) is always honoured.
 
     Returns:
         List of validation results
@@ -71,7 +186,12 @@ async def validate_policies(
     enable_parallel = config.get_setting("parallel_execution", True)
     enable_builtin_checks = config.get_setting("enable_builtin_checks", True)
 
-    registry = create_default_registry(enable_parallel=enable_parallel, include_builtin_checks=enable_builtin_checks)
+    suppress_superseded = config.get_setting("suppress_superseded_findings", False)
+    registry = create_default_registry(
+        enable_parallel=enable_parallel,
+        include_builtin_checks=enable_builtin_checks,
+        suppress_superseded=suppress_superseded,
+    )
 
     if not enable_builtin_checks:
         logger.info("Built-in checks disabled - using only custom checks")
@@ -89,10 +209,23 @@ async def validate_policies(
     # Priority: CLI arg > config file > default None
     checks_dir = custom_checks_dir or config.custom_checks_dir
     if checks_dir:
-        checks_dir_path = Path(checks_dir).resolve()
-        discovered_checks = ConfigLoader.discover_checks_in_directory(checks_dir_path, registry)
-        if discovered_checks:
-            logger.info("Auto-discovered %d custom checks from configured directory", len(discovered_checks))
+        # Auto-discovery executes repository Python. An explicitly passed
+        # custom_checks_dir (CLI flag / SDK argument) is caller consent; a
+        # dir sourced only from the YAML config additionally requires
+        # allow_config_custom_checks, because on CI events like
+        # pull_request_target the config file can be attacker-controlled.
+        if custom_checks_dir is None and not allow_config_custom_checks:
+            logger.warning(
+                "Ignoring custom_checks_dir from config file (%s): loading checks from a "
+                "config-referenced directory executes its Python code. Pass "
+                "--custom-checks-dir / --allow-config-custom-checks to opt in.",
+                checks_dir,
+            )
+        else:
+            checks_dir_path = Path(checks_dir).resolve()
+            discovered_checks = ConfigLoader.discover_checks_in_directory(checks_dir_path, registry)
+            if discovered_checks:
+                logger.info("Auto-discovered %d custom checks from configured directory", len(discovered_checks))
 
     # Apply configuration again to include custom checks
     # This allows configuring auto-discovered checks via the config file
@@ -116,18 +249,26 @@ async def validate_policies(
         cache_dir=cache_directory,
         aws_services_dir=services_dir,
     ) as fetcher:
-        tasks = [
-            _validate_policy_with_registry(
-                item[1],  # policy
-                item[0],  # file_path
-                registry,
-                fetcher,
-                fail_on_severities,
-                policy_type,
-                item[2] if len(item) == 3 else None,  # raw_dict (optional)
+        tasks = []
+        for item in policies:
+            policy_file = item[0]
+            policy_obj = item[1]
+            raw_dict = item[2] if len(item) == 3 else None
+
+            resolved_type, source, matched_pattern = _resolve_policy_type(policy_obj, policy_file, policy_type, config)
+            _log_resolved_policy_type(policy_file, resolved_type, source, matched_pattern)
+
+            tasks.append(
+                _validate_policy_with_registry(
+                    policy_obj,
+                    policy_file,
+                    registry,
+                    fetcher,
+                    fail_on_severities,
+                    resolved_type,
+                    raw_dict,
+                )
             )
-            for item in policies
-        ]
 
         results = await asyncio.gather(*tasks)
 
@@ -166,26 +307,51 @@ async def _validate_policy_with_registry(
         if loaded_result and isinstance(loaded_result, tuple):
             raw_policy_dict = loaded_result[1]
 
-    # Apply automatic policy-type validation (not configurable - always runs)
-    # Note: Import here to avoid circular import (policy_checks -> checks -> sdk -> policy_checks)
-    from iam_validator.checks import (  # pylint: disable=import-outside-toplevel
-        policy_type_validation,
-    )
+    # Policy-type validation now runs as the registered `policy_type_validation`
+    # policy-level check (configurable via the standard check config system).
 
-    policy_type_issues = await policy_type_validation.execute_policy(policy, policy_file, policy_type=policy_type)
-    result.issues.extend(policy_type_issues)  # pylint: disable=no-member
+    # Pre-scan for full-wildcard statements so policy-level findings for those
+    # statement indices can be suppressed below (same logic as statement-level).
+    suppressed_statement_indices: set[int] = set()
+    if registry.suppress_superseded and registry.is_enabled("full_wildcard"):
+        for idx, statement in enumerate(policy.statement or []):
+            if statement.is_full_wildcard_allow():
+                suppressed_statement_indices.add(idx)
 
     # Run policy-level checks first (checks that need to see the entire policy)
     # These checks examine relationships between statements, not individual statements
     policy_level_issues = await registry.execute_policy_checks(
         policy, policy_file, fetcher, policy_type, raw_policy_dict=raw_policy_dict
     )
+
+    # Drop policy-level findings that reference a suppressed statement — they are
+    # redundant when full_wildcard already flags the entire statement as */*.
+    if suppressed_statement_indices:
+        policy_level_issues = [
+            issue for issue in policy_level_issues if issue.statement_index not in suppressed_statement_indices
+        ]
+
     result.issues.extend(policy_level_issues)  # pylint: disable=no-member
+
+    # Statement-level checks whose findings don't apply to guardrail policy
+    # types (checks themselves are policy-type-blind, so filter here):
+    # - RCPs must use `Principal: "*"` (AWS syntax rule), so the wildcard
+    #   public-access findings from principal_validation are structural noise.
+    # - SCP allow-list statements legitimately use `Resource: "*"` and
+    #   service wildcards, so the wildcard trio flags normal SCP shape.
+    skipped_check_ids: frozenset[str] = frozenset()
+    if policy_type == "RESOURCE_CONTROL_POLICY":
+        skipped_check_ids = frozenset({"principal_validation"})
+    elif policy_type == "SERVICE_CONTROL_POLICY":
+        skipped_check_ids = frozenset({"wildcard_resource", "service_wildcard", "full_wildcard"})
 
     # Execute all statement-level checks for each statement
     for idx, statement in enumerate(policy.statement or []):
         # Execute all registered checks in parallel (with ignore_patterns filtering)
         issues = await registry.execute_checks_parallel(statement, idx, fetcher, policy_file)
+
+        if skipped_check_ids:
+            issues = [issue for issue in issues if issue.check_id not in skipped_check_ids]
 
         # Add issues to result
         result.issues.extend(issues)  # pylint: disable=no-member
