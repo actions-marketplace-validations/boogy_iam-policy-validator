@@ -808,8 +808,13 @@ def is_multivalued_context_key(condition_key: str) -> bool:
 
     Multivalued context keys include:
     - aws:TagKeys (list of tag keys being applied)
-    - aws:PrincipalOrgPaths (organization paths)
-    - Service-specific multivalued keys (e.g., s3:x-amz-grant-*)
+    - aws:PrincipalOrgPaths, aws:ResourceOrgPaths, aws:SourceOrgPaths, aws:VpceOrgPaths
+      (organization paths)
+    - aws:PrincipalServiceNamesList (service principal names of the calling service)
+    - aws:CalledVia (ordered list of services in a forward access session chain)
+
+    Service-specific multivalued keys are not listed here; they carry an ArrayOf prefix
+    in the Service Authorization Reference and are resolved from that data instead.
 
     Single-valued context keys include:
     - aws:SourceIp (single IP address)
@@ -845,21 +850,16 @@ def is_multivalued_context_key(condition_key: str) -> bool:
     multivalued_keys = {
         "aws:tagkeys",  # List of tag keys being applied/modified
         "aws:principalorgpaths",  # Organization paths for the principal
+        "aws:principalservicenameslist",  # Service principal names of the calling service
         "aws:resourceorgpaths",  # Organization paths for the resource
+        "aws:sourceorgpaths",  # Organization paths of the source resource owner
+        "aws:vpceorgpaths",  # Organization paths of the VPC endpoint owner
+        "aws:calledvia",  # Ordered list of services in the FAS call chain
     }
 
     # Check exact matches
     if key_lower in multivalued_keys:
         return True
 
-    # Service-specific multivalued patterns
-    # S3 grant headers are multivalued
-    if key_lower.startswith("s3:x-amz-grant-"):
-        return True
-
-    # EC2 resource tags in requests can be multivalued
-    if "ec2:" in key_lower and ":resourcetag/" in key_lower:
-        return True
-
-    # Most condition keys are single-valued by default
+    # Service-specific multivalued keys are resolved from their ArrayOf prefix by the caller.
     return False

@@ -135,6 +135,11 @@ DEFAULT_CONFIG = {
         "comment_tag": None,
         # Suppress redundant findings for statements already flagged by full_wildcard.
         "suppress_superseded_findings": True,
+        # What to do when a check raises instead of returning findings.
+        # fail: report a `check_execution_error` finding (severity error) so a run
+        #       cannot report clean on a validation that did not fully run (default)
+        # warn: log only, which lets a policy pass with that check's findings missing
+        "on_check_error": "fail",
     },
     # ========================================================================
     # AWS IAM Validation Checks (17 checks total)
@@ -146,8 +151,7 @@ DEFAULT_CONFIG = {
     # Validate Statement ID (Sid) uniqueness as per AWS IAM requirements
     # AWS requires:
     # - Sids must be unique within the policy (duplicate_sid error)
-    # - Sids must contain only alphanumeric characters, hyphens, and underscores
-    # - No spaces or special characters allowed
+    # - Sids may contain only A-Z, a-z and 0-9 - no hyphens, underscores or spaces
     "sid_uniqueness": {
         "enabled": True,
         "severity": "error",  # IAM validity error
@@ -231,7 +235,8 @@ DEFAULT_CONFIG = {
     # Using them with single-value keys can cause unexpected behavior
     "set_operator_validation": {
         "enabled": True,
-        "severity": "error",  # IAM validity error
+        # AWS accepts these policies; the docs only advise against the pattern.
+        "severity": "warning",
         "description": "Validates that set operators are used with multi-value condition keys",
     },
     # ========================================================================
@@ -389,7 +394,8 @@ DEFAULT_CONFIG = {
     #   ❌ s3:ListBucket with arn:aws:s3:::bucket/* (should be bucket, not object)
     "action_resource_matching": {
         "enabled": True,
-        "severity": "error",  # IAM validity error
+        # AWS accepts these policies; they just fail to grant. Not an IAM validity error.
+        "severity": "medium",
         "description": "Validates that resource ARNs match the required resource types for actions (including account-level actions)",
     },
     # ========================================================================

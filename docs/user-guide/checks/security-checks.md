@@ -338,6 +338,23 @@ Validates Principal elements in resource policies and trust policies.
 
 **Severity:** `high` (varies by issue type)
 
+**Scope:** `Effect: Deny` statements are skipped unless they use `NotPrincipal`.
+
+Every rule below describes an over-broad *grant*, and a `Deny` over `Principal` cannot
+over-grant — `Deny` with `Principal: "*"` is the standard guardrail idiom (resource
+control policies, org perimeters, `sts:TagSession` restrictions), and scoping it with
+`aws:SourceArn`/`aws:PrincipalOrgID` would narrow the deny and weaken the policy.
+
+Inverted denies are the exception, because the carve-out is the exposure. `NotPrincipal`
+spells the inversion with a principal, so those statements are still checked in full.
+[AWS recommends](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_notprincipal.html)
+spelling it with a condition instead — `Principal: "*"` plus `ArnNotEquals` on
+`aws:PrincipalArn` — and that form is reported as `ineffective_deny_carve_out` when the
+carve-out is `*`, since exempting every principal denies nobody.
+
+See also [`rcp_best_practices`](advanced-checks.md#rcp_best_practices) and
+[`not_principal_validation`](aws-validation.md#not_principal_validation).
+
 ### What It Checks
 
 - **Service Principal Wildcards** (`critical`): Detects dangerous `{"Service": "*"}` patterns
@@ -518,6 +535,8 @@ NotAction and NotResource grant permissions by **exclusion** rather than explici
 
 This makes it easy to accidentally grant more access than intended, especially as AWS adds new services and actions.
 
+The same exclusion logic inverts a `Deny`: with `Deny`, the listed items are the ones **not** denied, so the exclusion list is what stays reachable. An exclusion of `*` leaves everything reachable and the statement denies nothing.
+
 ### Patterns Detected
 
 1. **NotAction with Allow (no conditions)** - High: Near-administrator access
@@ -525,8 +544,25 @@ This makes it easy to accidentally grant more access than intended, especially a
 3. **NotResource with broad Resource** - High: Access to all resources except listed
 4. **Combined NotAction AND NotResource** - Critical: Near-administrator on nearly all resources
 5. **NotAction with Deny** - Low: Valid pattern but should be reviewed
+6. **NotResource with Deny** - Low: Inverted deny over broad actions, worth reviewing
+7. **NotResource with Deny and a `*` exclusion** - High: Every resource is excluded, so the statement denies nothing
 
 When both NotAction **and** NotResource are present in an Allow statement, only the combined critical finding is reported. The individual NotAction and NotResource warnings are suppressed to reduce noise.
+
+The `Deny` findings (5-7) apply a noise gate like their `Allow` counterparts: the review-level findings only fire when the *other* axis is broad (`Resource: "*"` for #5, a wildcarded `Action` for #6). Finding #7 is unconditional, because a statement that denies nothing is unambiguous.
+
+#### Deny Fail Example
+
+```json
+{
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:*",
+  "NotResource": "*"
+}
+```
+
+This reads like a lockdown but denies nothing: `NotResource: "*"` excludes every resource from the deny.
 
 ### Implicit Grant Analysis
 

@@ -32,8 +32,8 @@ class TestSetOperatorValidationCheck:
         assert "ForAnyValue" in check.description
 
     def test_default_severity(self, check):
-        """Test default severity is error."""
-        assert check.default_severity == "error"
+        """Test default severity is warning."""
+        assert check.default_severity == "warning"
 
     @pytest.mark.asyncio
     async def test_no_conditions(self, check, config):
@@ -103,7 +103,7 @@ class TestSetOperatorValidationCheck:
 
         # Check the single-valued key error
         single_valued_issue = [i for i in issues if i.issue_type == "set_operator_on_single_valued_key"][0]
-        assert single_valued_issue.severity == "error"
+        assert single_valued_issue.severity == "warning"
         assert "single-valued" in single_valued_issue.message.lower()
         assert "aws:SourceIp" in single_valued_issue.message
 
@@ -126,6 +126,28 @@ class TestSetOperatorValidationCheck:
         assert "single-valued" in issues[0].message.lower()
 
     @pytest.mark.asyncio
+    async def test_foranyvalue_with_calledvia(self, check, config):
+        """Test ForAnyValue with aws:CalledVia is accepted.
+
+        AWS documents aws:CalledVia as `Data type - String (list)` and
+        `Value type - Multivalued`, and multivalued keys require a set operator.
+        Both the Athena and forward-access-sessions guides use
+        ForAnyValue:StringEquals with this key.
+        """
+        statement = Statement(
+            effect="Allow",
+            action=["lambda:InvokeFunction"],
+            resource=["*"],
+            condition={
+                "ForAnyValue:StringEquals": {
+                    "aws:CalledVia": ["athena.amazonaws.com"],
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert issues == []
+
+    @pytest.mark.asyncio
     async def test_forallvalues_allow_without_null_check(self, check, config):
         """Test ForAllValues with Allow effect without Null check generates warning."""
         statement = Statement(
@@ -144,6 +166,34 @@ class TestSetOperatorValidationCheck:
         assert issues[0].severity == "warning"
         assert "Security risk" in issues[0].message
         assert "Null" in issues[0].message
+
+    @pytest.mark.asyncio
+    async def test_forallvalues_allow_miscased_null_check_suppresses_warning(self, check, config):
+        statement = Statement(
+            effect="Allow",
+            action=["s3:DeleteObjectTagging"],
+            resource=["*"],
+            condition={
+                "ForAllValues:StringEquals": {"aws:TagKeys": ["environment"]},
+                "Null": {"aws:tagkeys": "false"},
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert issues == []
+
+    @pytest.mark.asyncio
+    async def test_foranyvalue_deny_miscased_null_check_suppresses_warning(self, check, config):
+        statement = Statement(
+            effect="Deny",
+            action=["s3:DeleteObjectTagging"],
+            resource=["*"],
+            condition={
+                "ForAnyValue:StringEquals": {"aws:TagKeys": ["environment"]},
+                "Null": {"AWS:TAGKEYS": "false"},
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert issues == []
 
     @pytest.mark.asyncio
     async def test_forallvalues_deny_without_null_check_no_warning(self, check, config):
@@ -240,8 +290,12 @@ class TestSetOperatorValidationCheck:
         assert issues[0].issue_type == "forallvalues_allow_without_null_check"
 
     @pytest.mark.asyncio
-    async def test_s3_grant_header_is_multivalued(self, check, config):
-        """Test S3 grant headers are recognized as multivalued."""
+    async def test_s3_grant_header_is_single_valued(self, check, config):
+        """Test S3 grant headers are flagged as single-valued.
+
+        The Service Authorization Reference types every s3:x-amz-grant-* key as
+        `String`, not `ArrayOfString`.
+        """
         statement = Statement(
             effect="Allow",
             action=["s3:PutObjectAcl"],
@@ -256,8 +310,23 @@ class TestSetOperatorValidationCheck:
             },
         )
         issues = await check.execute(statement, 0, None, config)
-        # Should not generate set_operator_on_single_valued_key error
-        assert all(issue.issue_type != "set_operator_on_single_valued_key" for issue in issues)
+        assert any(issue.issue_type == "set_operator_on_single_valued_key" for issue in issues)
+
+    @pytest.mark.asyncio
+    async def test_ec2_resource_tag_is_single_valued(self, check, config):
+        """Test ec2:ResourceTag is flagged as single-valued, like aws:ResourceTag."""
+        statement = Statement(
+            effect="Allow",
+            action=["ec2:StartInstances"],
+            resource=["*"],
+            condition={
+                "ForAnyValue:StringEquals": {
+                    "ec2:ResourceTag/Environment": ["production"],
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert any(issue.issue_type == "set_operator_on_single_valued_key" for issue in issues)
 
     @pytest.mark.asyncio
     async def test_resource_org_paths_is_multivalued(self, check, config):
@@ -269,6 +338,54 @@ class TestSetOperatorValidationCheck:
             condition={
                 "ForAnyValue:StringEquals": {
                     "aws:ResourceOrgPaths": "${aws:PrincipalOrgPaths}",
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert all(issue.issue_type != "set_operator_on_single_valued_key" for issue in issues)
+
+    @pytest.mark.asyncio
+    async def test_principal_service_names_list_is_multivalued(self, check, config):
+        """Test aws:PrincipalServiceNamesList is recognized as multivalued."""
+        statement = Statement(
+            effect="Allow",
+            action=["s3:GetObject"],
+            resource=["*"],
+            condition={
+                "ForAnyValue:StringEquals": {
+                    "aws:PrincipalServiceNamesList": ["cloudtrail.amazonaws.com"],
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert all(issue.issue_type != "set_operator_on_single_valued_key" for issue in issues)
+
+    @pytest.mark.asyncio
+    async def test_source_org_paths_is_multivalued(self, check, config):
+        """Test aws:SourceOrgPaths is recognized as multivalued."""
+        statement = Statement(
+            effect="Allow",
+            action=["sts:AssumeRole"],
+            resource=["*"],
+            condition={
+                "ForAnyValue:StringLike": {
+                    "aws:SourceOrgPaths": ["o-example12345/r-ab12/ou-ab12-11111111/*"],
+                },
+            },
+        )
+        issues = await check.execute(statement, 0, None, config)
+        assert all(issue.issue_type != "set_operator_on_single_valued_key" for issue in issues)
+
+    @pytest.mark.asyncio
+    async def test_vpce_org_paths_is_multivalued(self, check, config):
+        """Test aws:VpceOrgPaths is recognized as multivalued."""
+        statement = Statement(
+            effect="Allow",
+            action=["s3:GetObject"],
+            resource=["*"],
+            condition={
+                "ForAnyValue:StringLike": {
+                    "aws:VpceOrgPaths": ["o-example12345/r-ab12/ou-ab12-11111111/*"],
                 },
             },
         )
@@ -331,7 +448,7 @@ class TestSetOperatorValidationCheck:
     @pytest.mark.asyncio
     async def test_custom_severity(self, check):
         """Test custom severity from config."""
-        config = CheckConfig(check_id="set_operator_validation", enabled=True, severity="warning")
+        config = CheckConfig(check_id="set_operator_validation", enabled=True, severity="error")
         statement = Statement(
             effect="Allow",
             action=["s3:GetObject"],
@@ -343,9 +460,10 @@ class TestSetOperatorValidationCheck:
             },
         )
         issues = await check.execute(statement, 0, None, config)
-        assert len(issues) == 2  # single-valued key error + missing Null check
-        # Both should have warning severity (the custom severity applies to the first, second is always warning)
-        assert all(issue.severity == "warning" for issue in issues)
+        assert len(issues) == 2
+        by_type = {issue.issue_type: issue.severity for issue in issues}
+        assert by_type["set_operator_on_single_valued_key"] == "error"
+        assert by_type["forallvalues_allow_without_null_check"] == "warning"
 
     @pytest.mark.asyncio
     async def test_null_check_with_true_value_still_warns(self, check, config):

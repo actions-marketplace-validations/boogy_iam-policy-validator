@@ -4,6 +4,73 @@ All notable changes to IAM Policy Validator are documented in this file.
 
 The format is based on [Common Changelog](https://common-changelog.org/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.0] - 2026-09-03
+
+Two unsound failure modes: a check that raised, and an action that could not be parsed, both ended with the validator reporting the policy clean. A run that cannot finish validating a policy must not pass it.
+
+### Added
+
+- `settings.on_check_error` (default `fail`) controls what happens when a check raises instead of returning findings. `fail` reports a `check_execution_error` finding at severity `error`; `warn` restores the previous log-only behaviour, for anyone who loads third-party custom checks and would rather not gate a run on their stability
+
+### Fixed
+
+- Report a check that raises instead of passing the policy clean. A raising check returns no findings, so the statement it was given went unvalidated by it — the registry logged `Check '<id>' failed` at warning level, dropped the check's entry, and a run gated on `error` reported the policy clean with nothing in the output saying validation had been incomplete. The exception now becomes a `check_execution_error` finding at severity `error` naming the check and the exception, on all five execution paths. That also removes an inconsistency: the single-enabled-check branch of `execute_checks_parallel` had no exception handling and propagated, so behaviour on a failing check depended on how many checks were enabled and whether parallel execution was on. The finding bypasses `_process_issues` deliberately — it is about the check, not from it, so the failing check's own `ignore_patterns` and severity overrides cannot silence the notice that it crashed. A buggy custom check now fails the run instead of degrading quietly; set `on_check_error: warn` to opt out
+- Report unparseable actions instead of aborting the check. `AWSServiceFetcher.validate_action`, `validate_actions_batch` and `validate_condition_key` called `parse_action` outside a `try`, so an action whose service prefix cannot be parsed raised `ValueError` out of the check — `action_validation` and `condition_key_validation` were silently skipped for that statement and the policy passed, including for the valid actions sitting next to the malformed one. The most common real-world case is a wildcard service prefix such as `"*:Untag*"`, written to cover an action across services, which AWS rejects outright with `MalformedPolicyDocument: Action vendors (e.g., aws, ec2, etc.) must not contain wildcards`. All three entry points now return their documented result type, and `describe_action_format_error` explains the failure: it names the wildcard-vendor case, quotes the AWS error, and suggests one action per service while noting that a wildcard inside the action _name_ is fine. A missing `":"` separator gets its own message, and both `*` and `?` count as a wildcard in the service prefix, matching AWS, which rejects `"ec?:DescribeTags"` identically
+
+## [1.25.1] - 2026-08-31
+
+### Changed
+
+- Upgrade locked dependencies: `boto3`/`botocore` 1.43.66 → 1.43.83, `pydantic` 2.13.4 → 2.13.5, `fastmcp` 3.4.6 → 3.4.7, `ruff` 0.16.1 → 0.16.5, `mypy` 2.3.0 → 2.3.1, `starlette` 1.4.1 → 1.6.0, `cryptography` 50.0.0 → 50.0.1 and their transitive dependencies. Declared version floors are unchanged, so the supported range is not narrowed
+- Lower `set_operator_validation` from `error` to `warning`. This repository defines `error` as "AWS will reject the policy", but AWS accepts a set operator on a single-valued key — its documentation only states "Do not use condition set operators `ForAllValues` or `ForAnyValue` with single-valued context keys" as guidance. This also softens the 1.25.0 change that newly flagged `s3:x-amz-grant-*` and `ec2:ResourceTag/*`: those findings no longer fail a run gated on `error`. Set `severity: error` under `set_operator_validation` to restore the previous behaviour
+- Lower `action_resource_matching` from `error` to `medium` in the default config, matching the severity the check class, the docs and `iam_validator/checks/CLAUDE.md` have always declared — AWS accepts a policy whose resource ARN does not match the action's resource type, it simply fails to grant
+- Raise the `sid_uniqueness` check class default from `warning` to `error`, matching the default config, the docs and AWS: "In IAM, the Sid value must be unique within a JSON policy". Only callers that ran the check without a `ValidatorConfig` (the SDK, direct instantiation) saw `warning`; every CLI run already reported `error`
+- Type-annotate the codebase so `uv run mypy iam_validator/` is clean (66 errors in 26 files → 0). Empty-collection accumulators carry explicit element types, `_query_arn_table` declares the `list[str]` branch it could already return, and eight locals that reused an outer name for a different type were renamed. No runtime behaviour changes
+
+### Fixed
+
+- Match condition key names case-insensitively in `find_matching_condition_key` and `AWSGlobalConditions`, so `"s3:requestobjecttagkeys"` and `"aws:sourceip"` resolve to the same AWS metadata as their canonically cased spellings — AWS states condition key names are not case-sensitive, and the case-sensitive lookups produced a false `set_operator_on_single_valued_key` on miscased multivalued keys and a false unknown-key finding on miscased global keys. Tag keys after the `/` are matched case-insensitively too (AWS: "Tag keys are not case-sensitive")
+- Drop the `StringEquals` operator pin from the `aws:PrincipalOrgPaths` entry in `CROSS_ACCOUNT_ORG_REQUIREMENT`, so a cross-account root policy guarded with `ForAnyValue:StringLike` is no longer reported as missing the required org condition — `aws:PrincipalOrgPaths` is multivalued and requires a set operator, and `StringEquals` does not expand the trailing `/*` the suggested example relied on
+- Add six global condition keys AWS documents but `AWS_GLOBAL_CONDITION_KEYS` was missing, which `condition_key_validation` reported as unknown: `aws:CalledViaAWSMCP`, `aws:IsMcpServiceAction`, `aws:ViaAWSMCPService`, `aws:ViaCustomerDomain`, `aws:SignInSessionArn` and `aws:SourceVpcArn`. AWS's own documented example policies for all six now validate clean
+- Reject a bare `Null` condition as proof that a `principal_condition_requirements` or `action_condition_requirements` entry is satisfied — `Null` only asserts a key's presence or absence and never constrains its value, so `"Null": {"aws:PrincipalOrgID": "false"}` alone cleared the cross-account org requirement it could not enforce
+- Match condition keys and operators case-insensitively in the `principal_validation` and `action_condition_enforcement` requirement lookups, so `"stringequals"` / `"aws:principalorgid"` no longer produce a false `missing_principal_condition_*` or missing-condition finding
+- Pair a `Null` check with its set-operator key case-insensitively in `set_operator_validation`, so `"Null": {"aws:tagkeys": "false"}` suppresses `forallvalues_allow_without_null_check` on `aws:TagKeys` as the canonically cased spelling already did, and stop treating a miscased `"AWS:"` prefix as a service prefix when resolving the key's type
+- Correct the severities documented for `sid_uniqueness` (`warning` → `error`) and `action_condition_enforcement` (`error` → `high`) in the check reference, and stop `examples/mcp-llm-instructions/organization_config.yaml` from lowering `sid_uniqueness` to `warning` while raising every neighbouring check
+- Correct the `sid_uniqueness` module docstring and default-config comment: unique Sids are an AWS requirement, not a best practice, and the Sid charset AWS accepts is `A-Z a-z 0-9` only — not hyphens and underscores, which the check's own regex has always rejected
+- Type all seven multivalued global condition keys as `ArrayOfString` in `AWS_GLOBAL_CONDITION_KEYS` — `aws:ResourceOrgPaths` alone carried it, leaving the table contradicting `is_multivalued_context_key` for the other six
+
+## [1.25.0] - 2026-08-30
+
+### Changed
+
+- **Breaking-ish (intended):** treat `s3:x-amz-grant-*` and `ec2:ResourceTag/*` as single-valued, so a set operator on them now raises `set_operator_on_single_valued_key` — the Service Authorization Reference types both as `String`, not `ArrayOfString`, and `ec2:ResourceTag/*` was the only `ResourceTag` variant exempt from the error that `aws:ResourceTag/*` and every other service prefix already produced. Genuinely multivalued service keys keep working: they are resolved from their `ArrayOf` prefix in the Service Authorization Reference. A policy that used a set operator on these keys passed on 1.24.0 and now fails at severity `error` ([#164])
+
+### Fixed
+
+- Treat `aws:CalledVia` as multivalued, so a set operator on it no longer raises `set_operator_on_single_valued_key` — AWS types it `Value type - Multivalued`, and multivalued keys require one; `aws:CalledViaFirst` and `aws:CalledViaLast` stay single-valued
+- Treat `aws:PrincipalServiceNamesList`, `aws:SourceOrgPaths` and `aws:VpceOrgPaths` as multivalued, completing the set of 7 keys AWS documents as `Value type - Multivalued` — AWS states outright that each requires `ForAnyValue` or `ForAllValues`, and `principal_validation` already recommends `ForAnyValue:StringLike` on `aws:SourceOrgPaths` for OU-level confused deputy protection ([#162])
+
+## [1.24.0] - 2026-08-21
+
+### Added
+
+- Add `not_resource_deny_review` (low) and `not_resource_deny_ineffective` findings to `not_action_not_resource` for `NotResource` used with `Deny` — mirrors the existing `NotAction` + `Deny` checks on the resource axis; a `NotResource: "*"` exclusion denies nothing ([#155])
+- Add `ineffective_deny_carve_out` finding to `principal_validation` for a `Deny` with a negated principal condition (e.g. `ArnNotEquals` on `aws:PrincipalArn`) that carves out every principal, closing the gap left when migrating off `NotPrincipal` ([#153])
+
+### Fixed
+
+- Skip `Deny` statements in `principal_validation` (blocked principals, the `{"Service": "*"}` wildcard, `allowed_principals`, `principal_condition_requirements`) — a `Deny` over `Principal` grants nothing, so these rules produced false positives; `NotPrincipal` denies remain fully checked ([#153])
+
+## [1.23.2] - 2026-08-07
+
+### Fixed
+
+- GitHub Action: space-separated `path` inputs are recognized again. Since 1.22.0 the path-parsing loops split `$INPUT_PATH` with `IFS=$'\n'` only, so a space-separated file list (what `tj-actions/changed-files` emits by default) collapsed into one non-existent path and the action reported `No IAM policies found. Skipping validation.` Both loops now split on newlines and whitespace, with globbing disabled (`set -f`) so path values are still never expanded by the shell. Before 1.22.0 the same loops used an unquoted `${{ inputs.path }}` template splice, whose literal word boundaries hid the issue; removing that splice (a deliberate injection fix) exposed it.
+
+### Changed
+
+- Refresh `uv.lock` dependency versions: `cryptography` 50.0.0, `starlette` 1.4.1, `boto3`/`botocore`/`types-boto3` 1.43.66, `fastmcp`/`fastmcp-slim` 3.4.6, `pydantic-settings` 2.15.0, `sse-starlette` 3.4.8, `librt` 0.15.0, `ast-serialize` 0.7.0, `cffi` 2.1.1, `ruff` 0.16.1, `coverage` 7.15.4, `cyclopts` 4.22.5, and other transitive pins.
+
 ## [1.23.1] - 2026-07-30
 
 ### Changed
@@ -727,6 +794,15 @@ _First release._
 
 ---
 
+[#164]: https://github.com/boogy/iam-policy-validator/pull/164
+[#162]: https://github.com/boogy/iam-policy-validator/issues/162
+[1.26.0]: https://github.com/boogy/iam-policy-validator/compare/v1.25.1...v1.26.0
+[1.25.1]: https://github.com/boogy/iam-policy-validator/compare/v1.25.0...v1.25.1
+[1.25.0]: https://github.com/boogy/iam-policy-validator/compare/v1.24.0...v1.25.0
+[1.24.0]: https://github.com/boogy/iam-policy-validator/compare/v1.23.2...v1.24.0
+[#155]: https://github.com/boogy/iam-policy-validator/pull/155
+[#153]: https://github.com/boogy/iam-policy-validator/pull/153
+[1.23.2]: https://github.com/boogy/iam-policy-validator/compare/v1.23.1...v1.23.2
 [1.23.1]: https://github.com/boogy/iam-policy-validator/compare/v1.23.0...v1.23.1
 [1.23.0]: https://github.com/boogy/iam-policy-validator/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/boogy/iam-policy-validator/compare/v1.21.1...v1.22.0
