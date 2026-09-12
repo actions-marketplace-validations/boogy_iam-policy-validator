@@ -4,6 +4,17 @@ All notable changes to IAM Policy Validator are documented in this file.
 
 The format is based on [Common Changelog](https://common-changelog.org/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.27.2] - 2026-09-11
+
+Fixes the "everything is fixed but the PR still looks dirty" case — PR labels whose names are not URL-safe could never be removed, and ignore records outlived the findings they silenced — and enforces the ignore store's anti-tampering guarantee, which had no callers and so had never been applied.
+
+### Fixed
+
+- `remove_label` percent-encodes the label name before putting it in the request path. httpx only escapes spaces, so a label containing `/`, `#`, `%` or `+` produced a wrong path and the delete silently 404'd — labels could be added (a JSON body) but never removed
+- `get_labels` reads through pagination instead of a single page. GitHub caps the endpoint at 30 labels per page, so on a PR carrying more than that the validator's own labels could fall outside the "current" set and never be removed
+- Ignore records are reconciled against each run's findings: once a finding is no longer reported, its record is dropped from the storage comment, so the PR summary stops showing an **Ignored Findings** count and table for issues that were already fixed. Reconciliation is scoped to the files a run validated, so a partial run cannot discard ignores for policies it never looked at
+- Ignore records are verified against the reply comment that requested them, which nothing did before: `verify_ignored_findings` and `remove_invalid_findings` existed but had no callers, so the anti-tampering guarantee in their docstrings was never enforced and a hand-edited storage comment could silence findings under another user's name. A record is now dropped when its reply comment is gone (the ignore was revoked) or is authored by someone other than the recorded `ignored_by`. Verification reads one paginated review-comment listing instead of one API call per record, and an incomplete listing skips verification rather than revoking valid ignores — `_make_paginated_request(raise_on_error=True)` distinguishes a failed fetch from an empty one
+
 ## [1.27.1] - 2026-09-10
 
 A remediation release. Trust-policy validation, PR inline-comment line resolution and condition-operator polarity are corrected across the board, and the MCP check catalog now reports what validation will actually do rather than class defaults.
@@ -899,6 +910,7 @@ _First release._
 
 [#164]: https://github.com/boogy/iam-policy-validator/pull/164
 [#162]: https://github.com/boogy/iam-policy-validator/issues/162
+[1.27.2]: https://github.com/boogy/iam-policy-validator/compare/v1.27.1...v1.27.2
 [1.27.1]: https://github.com/boogy/iam-policy-validator/compare/v1.27.0...v1.27.1
 [1.27.0]: https://github.com/boogy/iam-policy-validator/compare/v1.26.0...v1.27.0
 [1.26.0]: https://github.com/boogy/iam-policy-validator/compare/v1.25.1...v1.26.0
