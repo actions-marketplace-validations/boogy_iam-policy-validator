@@ -19,7 +19,7 @@ core/
 ├── diff_parser.py          # git-diff parsing
 ├── finding_fingerprint.py  # FindingFingerprint, compute_finding_hash() (canonical 16-char)
 ├── label_manager.py        # severity → PR label mapping
-├── access_analyzer.py      # AWS Access Analyzer client
+├── access_analyzer.py      # AWS Access Analyzer client + filter_report_by_severity()
 ├── access_analyzer_report.py # markdown formatter for Access Analyzer
 ├── ignore_patterns.py      # CODEOWNERS-driven finding suppression
 ├── ignore_processor.py     # ignore-command parser
@@ -74,6 +74,21 @@ in summary). `protected_fingerprints` keeps off-diff comments alive across the
 
 ---
 
+## `hide_severities` means gone (gotcha)
+
+A hidden severity is removed from the run, not muted: `_process_issues` drops it before
+the report is generated, so it is not shown, not counted and not part of the pass/fail
+decision — hiding a severity that `fail_on_severity` lists stops it failing the run.
+The Access Analyzer path applies the same rule through
+`access_analyzer.filter_report_by_severity()` (`error`/`warning`/`info`, mapped from the
+finding type), called in `commands/analyze.py` before the report is rendered.
+
+The single exception is `check_execution_error`: `_handle_check_error` findings bypass
+`_process_issues` entirely, so a crashing check cannot silence the notice that it
+crashed (`settings.on_check_error: warn` is the opt-out).
+
+---
+
 ## Finding suppression
 
 Gated on `settings.suppress_superseded_findings` (default true) and applied in two
@@ -94,6 +109,12 @@ not a `PolicyCheck`, or whose `check_id` is already registered, is logged and sk
 rather than aborting discovery. It lives in `check_registry` so `create_default_registry()`
 does not have to import `config_loader`. Patch `iam_validator.core.check_registry.entry_points`
 in tests.
+
+`validate_policies` runs `ConfigLoader.apply_config_to_registry` again after custom checks
+load, so it must layer the check's top-level config section over the registry's existing
+`CheckConfig` (per key for options; `enabled`, `severity`, `description` only when set), never
+replace it — a `custom_checks:` module entry's `severity`, `description` and `config:` exist
+only in that registered config.
 
 ---
 
@@ -137,6 +158,13 @@ config = load_validator_config("iam-validator.yaml")  # Priority: CLI > config >
 `config/`:
 
 - `defaults.py` — defaults (don't hardcode `policy_type` here; see policy-size gotcha in CHANGELOG 1.19.0)
+
+A check's options sit directly under its id (`CheckConfig.config` is that dict).
+`apply_config_to_registry` warns once per `ValidatorConfig` for a registered check with a
+nested `config:` key; `custom_checks:` module entries are the exception and keep `config:`.
+`validate_policies(config=...)` takes a loaded config so callers that already read it
+(`analyze`) don't load it twice.
+
 - `sensitive_actions.py` — 490+ entries by risk category
 - `condition_requirements.py` — action → required conditions
 - `aws_global_conditions.py` — all AWS global condition keys
